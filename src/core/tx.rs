@@ -1,5 +1,6 @@
 use crate::core::address::{ADDRESS_LEN, Address};
 use crate::crypto::keys::{Keypair, verify_signature};
+use serde_json::json;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferTx {
@@ -59,5 +60,17 @@ impl TransferTx {
     pub fn verify_signature(&self) -> bool {
         let payload = self.signing_payload();
         verify_signature(&self.sender_public_key, &payload, &self.signature)
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        let value = json!({
+            "sender_public_key": hex::encode(self.sender_public_key),
+            "sender": self.sender.to_hex(),
+            "object_id": self.object_id,
+            "new_owner": self.new_owner.to_hex(),
+            "nonce": self.nonce,
+            "signature": hex::encode(self.signature),
+        });
+        serde_json::to_string_pretty(&value)
     }
 }

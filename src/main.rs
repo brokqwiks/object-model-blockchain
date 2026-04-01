@@ -1,5 +1,6 @@
 mod core;
 mod crypto;
+mod object_standards;
 use crate::core::{
     address::{Address, NETWORK_TESTNET},
     object::Object,
@@ -8,6 +9,7 @@ use crate::core::{
     tx::TransferTx,
 };
 use crate::crypto::keys::Keypair;
+use crate::object_standards::token::BasicToken;
 
 fn main() {
     let sender_keypair = Keypair::generate();
@@ -45,7 +47,24 @@ fn main() {
 
     let hash = crate::crypto::hash::sha256(serialized.as_bytes());
     println!("object hash: {}", hex::encode(hash));
+    println!(
+        "transaction json:\n{}",
+        tx.to_json_pretty()
+            .expect("transaction json serialization failed")
+    );
 
     println!("sender address: {}", sender.to_hex());
     println!("recipient address: {}", recipient.to_hex());
+
+    let mut lyx_coin = BasicToken::new(
+        "LYX Coin",
+        "LYX",
+        9,
+        "Native token for LYX blockchain",
+        1000000000000
+    )
+    .mint()
+
+    println!("token standard json:\n{token_json}");
+    println!("coin object json:\n{coin_json}");
 }
