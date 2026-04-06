@@ -1,4 +1,4 @@
-use crate::core::address::Address;
+use crate::core::{address::Address, object::Ownable, object_address::ObjectAddress, owner::Owner};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +19,7 @@ pub struct TreasuryCap {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coin {
     pub id: u64,
+    pub object_address: ObjectAddress,
     pub owner: Address,
     pub amount: u64,
     pub version: u64,
@@ -83,6 +84,7 @@ impl BasicToken {
 
         let coin = Coin {
             id: self.next_coin_id,
+            object_address: ObjectAddress::new_unique(),
             owner: recipient,
             amount,
             version: 0,
@@ -107,18 +109,6 @@ impl BasicToken {
 }
 
 impl Coin {
-    pub fn transfer(self, sender: Address, recipient: Address) -> Result<Self, TokenError> {
-        if self.owner != sender {
-            return Err(TokenError::UnauthorizedTransfer);
-        }
-
-        Ok(Self {
-            owner: recipient,
-            version: self.version.saturating_add(1),
-            ..self
-        })
-    }
-
     pub fn split(self, amount: u64, new_coin_id: u64) -> Result<(Self, Self), TokenError> {
         if amount == 0 {
             return Err(TokenError::InvalidAmount);
@@ -135,6 +125,7 @@ impl Coin {
 
         let split = Self {
             id: new_coin_id,
+            object_address: ObjectAddress::new_unique(),
             owner: self.owner,
             amount,
             version: 0,
@@ -163,10 +154,29 @@ impl Coin {
     }
 }
 
+impl Ownable for Coin {
+    fn owner(&self) -> Owner {
+        Owner::Address(self.owner)
+    }
+
+    fn set_owner(&mut self, owner: Owner) {
+        match owner {
+            Owner::Address(address) => self.owner = address,
+            Owner::Object(_) => {}
+        }
+    }
+
+    fn bump_version(&mut self) {
+        self.version = self.version.saturating_add(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::core::address::{Address, NETWORK_TESTNET};
     use crate::crypto::keys::Keypair;
+    use crate::core::object::Ownable;
+    use crate::core::owner::Owner;
     use crate::object_standards::token::{BasicToken, TokenError};
 
     fn address_with_seed(seed: u8) -> Address {
@@ -183,7 +193,10 @@ mod tests {
         let coin = token.mint(alice, 1_000).expect("mint should succeed");
         assert_eq!(token.treasury.total_supply, 1_000);
 
-        let coin = coin.transfer(alice, bob).expect("transfer should succeed");
+        let mut coin = coin;
+        coin
+            .transfer_ownership(Owner::Address(alice), Owner::Address(bob))
+            .expect("transfer should succeed");
         assert_eq!(coin.owner, bob);
 
         token.burn(coin).expect("burn should succeed");
@@ -212,5 +225,16 @@ mod tests {
 
         let joined = remainder.join(split).expect("join should succeed");
         assert_eq!(joined.amount, 500);
+    }
+
+    #[test]
+    fn minted_coins_have_unique_object_addresses() {
+        let mut token = BasicToken::new("SuiLike", "SUIX", 9, "Demo token", None);
+        let alice = address_with_seed(15);
+
+        let first = token.mint(alice, 1).expect("first mint should succeed");
+        let second = token.mint(alice, 1).expect("second mint should succeed");
+
+        assert_ne!(first.object_address, second.object_address);
     }
 }

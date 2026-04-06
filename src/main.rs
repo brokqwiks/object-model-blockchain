@@ -1,12 +1,13 @@
 mod core;
 mod crypto;
 mod object_standards;
+
 use crate::core::{
     address::{Address, NETWORK_TESTNET},
     object::Object,
     owner::Owner,
     state::State,
-    tx::TransferTx,
+    tx::{Effect, Transaction},
 };
 use crate::crypto::keys::Keypair;
 use crate::object_standards::token::BasicToken;
@@ -17,54 +18,49 @@ fn main() {
     let sender = Address::from_public_key(&sender_keypair.verifying_key_bytes(), NETWORK_TESTNET);
     let recipient =
         Address::from_public_key(&recipient_keypair.verifying_key_bytes(), NETWORK_TESTNET);
-    let object = Object::new(0, Owner::Address(sender));
+
+    let object = Object::new(Owner::Address(sender));
+    let object_address = object.object_address();
+    let mut token = BasicToken::new("LYX Coin", "LYX", 9, "Native token demo", Some(1_000_000_000_000));
+    let coin = token.mint(sender, 1_000_000).expect("mint should succeed");
+    let coin_address = coin.object_address;
+
     let mut state = State::new();
     state.insert_object(object);
+    state.insert_coin(coin);
 
-    let tx = TransferTx::new_unsigned(
+    let tx = Transaction::new_unsigned(
         sender_keypair.verifying_key_bytes(),
         sender,
-        object.id(),
-        recipient,
         0,
+        vec![
+            Effect::TransferObject {
+                object_address,
+                new_owner: recipient,
+            },
+            Effect::TransferCoin {
+                coin_address,
+                new_owner: recipient,
+            },
+        ],
     )
     .sign(&sender_keypair)
     .expect("tx signing failed");
 
-    state
-        .apply_transfer_tx(&tx)
-        .expect("tx apply should succeed");
-    let updated_object = state
-        .get_object(object.id())
-        .expect("object should exist after tx");
+    state.apply_tx(&tx).expect("tx apply should succeed");
 
-    println!("object id: {}", updated_object.id());
-    println!("owner: {}", updated_object.owner().to_hex());
-    println!("version: {}", updated_object.version());
+    let moved_object = state
+        .get_object(object_address)
+        .expect("object should exist");
+    let moved_coin = state.get_coin(coin_address).expect("coin should exist");
 
-    let serialized = serde_json::to_string(updated_object).expect("object serialization failed");
-    println!("serialized object: {serialized}");
-
-    let hash = crate::crypto::hash::sha256(serialized.as_bytes());
-    println!("object hash: {}", hex::encode(hash));
+    println!("object address: {}", moved_object.object_address().to_hex());
+    println!("coin address: {}", moved_coin.object_address.to_hex());
+    println!("object owner: {}", moved_object.owner().to_hex());
+    println!("coin owner: {}", moved_coin.owner.to_hex());
     println!(
         "transaction json:\n{}",
         tx.to_json_pretty()
             .expect("transaction json serialization failed")
     );
-
-    println!("sender address: {}", sender.to_hex());
-    println!("recipient address: {}", recipient.to_hex());
-
-    let mut lyx_coin = BasicToken::new(
-        "LYX Coin",
-        "LYX",
-        9,
-        "Native token for LYX blockchain",
-        1000000000000
-    )
-    .mint()
-
-    println!("token standard json:\n{token_json}");
-    println!("coin object json:\n{coin_json}");
 }
