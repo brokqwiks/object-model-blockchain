@@ -2,65 +2,597 @@ mod core;
 mod crypto;
 mod object_standards;
 
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
 use crate::core::{
-    address::{Address, NETWORK_TESTNET},
-    object::Object,
-    owner::Owner,
-    state::State,
+    address::Address,
+    object_address::ObjectAddress,
+    state::{State, StateError},
     tx::{Effect, Transaction},
 };
-use crate::crypto::keys::Keypair;
+use crate::crypto::keys::MasterAccountKeyManager;
 use crate::object_standards::token::BasicToken;
 
+const DEFAULT_DB_PATH: &str = "./data/state.db";
+const DEFAULT_WALLETS_PATH: &str = "./data/wallets.json";
+const DEFAULT_NETWORK: u8 = 0x01;
+const DEFAULT_POOL_SIZE: usize = 1024;
+const GENESIS_ALIAS: &str = "genesis";
+const GENESIS_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const GENESIS_SUPPLY: u64 = 1_000_000;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WalletEntry {
+    mnemonic: Option<String>,
+    master_secret_hex: Option<String>,
+    network: u8,
+    pool_size: usize,
+    next_index: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyWalletEntryV1 {
+    mnemonic: String,
+    network: u8,
+    pool_size: usize,
+    next_index: u64,
+}
+
 fn main() {
-    let sender_keypair = Keypair::generate();
-    let recipient_keypair = Keypair::generate();
-    let sender = Address::from_public_key(&sender_keypair.verifying_key_bytes(), NETWORK_TESTNET);
-    let recipient =
-        Address::from_public_key(&recipient_keypair.verifying_key_bytes(), NETWORK_TESTNET);
+    if let Err(err) = run_repl() {
+        eprintln!("fatal error: {err}");
+        std::process::exit(1);
+    }
+}
 
-    let object = Object::new(Owner::Address(sender));
-    let object_address = object.object_address();
-    let mut token = BasicToken::new("LYX Coin", "LYX", 9, "Native token demo", Some(1_000_000_000_000));
-    let coin = token.mint(sender, 1_000_000).expect("mint should succeed");
-    let coin_address = coin.object_address;
+fn run_repl() -> Result<(), String> {
+    ensure_parent_dir(DEFAULT_WALLETS_PATH)?;
 
-    let mut state = State::new();
-    state.insert_object(object);
-    state.insert_coin(coin);
+    let mut wallets = load_wallets(DEFAULT_WALLETS_PATH)?;
+    let mut state = State::load_or_create(DEFAULT_DB_PATH, 1)
+        .map_err(|e| format!("state load/create failed: {e:?}"))?;
 
-    let tx = Transaction::new_unsigned(
-        sender_keypair.verifying_key_bytes(),
-        sender,
-        0,
-        vec![
-            Effect::TransferObject {
-                object_address,
-                new_owner: recipient,
+    ensure_genesis(&mut state, &mut wallets)?;
+    persist_all(&state, &wallets)?;
+
+    println!("Object Model Blockchain REPL");
+    println!("DB: {DEFAULT_DB_PATH}");
+    println!("Wallets: {DEFAULT_WALLETS_PATH}");
+    println!("Type `help` for commands.");
+    println!("Process is persistent; close window or press Ctrl+C to stop.");
+
+    let mut stdin_closed = false;
+    loop {
+        if !stdin_closed {
+            print!("om-chain> ");
+            io::stdout().flush().map_err(|e| format!("flush failed: {e}"))?;
+        }
+
+        let mut line = String::new();
+        if io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("read failed: {e}"))?
+            == 0
+        {
+            if !stdin_closed {
+                eprintln!("stdin closed: waiting for manual process stop (Ctrl+C).");
+                stdin_closed = true;
+            }
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        stdin_closed = false;
+
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("exit") || line.eq_ignore_ascii_case("quit") {
+            println!("REPL does not exit by command. Use Ctrl+C or close the terminal.");
+            continue;
+        }
+
+        if let Err(err) = execute_command(line, &mut state, &mut wallets) {
+            eprintln!("error: {err}");
+        } else {
+            persist_all(&state, &wallets)?;
+        }
+    }
+}
+
+fn execute_command(
+    line: &str,
+    state: &mut State,
+    wallets: &mut HashMap<String, WalletEntry>,
+) -> Result<(), String> {
+    if let Some(rest) = line.strip_prefix("wallet import-mnemonic ") {
+        let mut parts = rest.splitn(2, ' ');
+        let name = parts
+            .next()
+            .ok_or_else(|| "usage: wallet import-mnemonic <name> <mnemonic...>".to_string())?;
+        let mnemonic = parts
+            .next()
+            .ok_or_else(|| "usage: wallet import-mnemonic <name> <mnemonic...>".to_string())?
+            .trim();
+        if wallets.contains_key(name) {
+            return Err(format!("wallet `{}` already exists", name));
+        }
+        let manager = MasterAccountKeyManager::from_mnemonic_phrase(
+            mnemonic,
+            DEFAULT_NETWORK,
+            DEFAULT_POOL_SIZE,
+        )
+        .map_err(|e| format!("invalid mnemonic: {e:?}"))?;
+        wallets.insert(
+            name.to_string(),
+            WalletEntry {
+                mnemonic: Some(mnemonic.to_string()),
+                master_secret_hex: None,
+                network: DEFAULT_NETWORK,
+                pool_size: DEFAULT_POOL_SIZE,
+                next_index: 0,
             },
-            Effect::TransferCoin {
-                coin_address,
-                new_owner: recipient,
-            },
-        ],
-    )
-    .sign(&sender_keypair)
-    .expect("tx signing failed");
+        );
+        println!("wallet `{name}` imported");
+        println!("address: {}", manager.account_address().to_hex());
+        println!("one_time_root: {}", hex::encode(manager.one_time_root()));
+        return Ok(());
+    }
 
-    state.apply_tx(&tx).expect("tx apply should succeed");
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["help"] => {
+            print_help();
+            Ok(())
+        }
+        ["show-state"] => {
+            let s = state.summary();
+            println!("chain_id: {}", s.chain_id);
+            println!("genesis_applied: {}", s.genesis_applied);
+            println!("objects: {}", s.objects);
+            println!("coins: {}", s.coins);
+            println!("accounts_with_nonces: {}", s.accounts_with_nonces);
+            println!("accounts_with_roots: {}", s.accounts_with_roots);
+            println!("transactions: {}", s.transactions);
+            Ok(())
+        }
+        ["wallet", "new", name] => {
+            if wallets.contains_key(*name) {
+                return Err(format!("wallet `{}` already exists", name));
+            }
+            let (mnemonic, manager) =
+                MasterAccountKeyManager::new_from_random_mnemonic(DEFAULT_NETWORK, DEFAULT_POOL_SIZE)
+                    .map_err(|e| format!("wallet generation failed: {e:?}"))?;
+            let address = manager.account_address();
+            let root = manager.one_time_root();
+            wallets.insert(
+                (*name).to_string(),
+                WalletEntry {
+                    mnemonic: Some(mnemonic.clone()),
+                    master_secret_hex: None,
+                    network: DEFAULT_NETWORK,
+                    pool_size: DEFAULT_POOL_SIZE,
+                    next_index: 0,
+                },
+            );
+            println!("wallet `{name}` created");
+            println!("mnemonic: {mnemonic}");
+            println!("address: {}", address.to_hex());
+            println!("one_time_root: {}", hex::encode(root));
+            Ok(())
+        }
+        ["wallet", "list"] => {
+            if wallets.is_empty() {
+                println!("no wallets");
+                return Ok(());
+            }
+            for (name, entry) in wallets.iter() {
+                let manager = manager_from_entry(entry)?;
+                println!(
+                    "{} => address: {}, next_index: {}",
+                    name,
+                    manager.account_address().to_hex(),
+                    entry.next_index
+                );
+            }
+            Ok(())
+        }
+        ["wallet", "show", name] => {
+            let entry = wallets
+                .get(*name)
+                .ok_or_else(|| format!("wallet `{}` not found", name))?;
+            let manager = manager_from_entry(entry)?;
+            println!("wallet: {name}");
+            match (&entry.mnemonic, &entry.master_secret_hex) {
+                (Some(m), _) => println!("mnemonic: {m}"),
+                (_, Some(secret)) => println!("master_secret_hex: {secret}"),
+                _ => println!("wallet material: <none>"),
+            }
+            println!("address: {}", manager.account_address().to_hex());
+            println!("one_time_root: {}", hex::encode(manager.one_time_root()));
+            println!("next_index: {}", entry.next_index);
+            Ok(())
+        }
+        ["wallet", "import-secret", name, secret_hex] => {
+            if wallets.contains_key(*name) {
+                return Err(format!("wallet `{}` already exists", name));
+            }
+            let secret = parse_hex_32(secret_hex)?;
+            let manager = MasterAccountKeyManager::from_master_secret(
+                secret,
+                DEFAULT_NETWORK,
+                DEFAULT_POOL_SIZE,
+            )
+            .map_err(|e| format!("invalid secret: {e:?}"))?;
+            wallets.insert(
+                (*name).to_string(),
+                WalletEntry {
+                    mnemonic: None,
+                    master_secret_hex: Some((*secret_hex).to_string()),
+                    network: DEFAULT_NETWORK,
+                    pool_size: DEFAULT_POOL_SIZE,
+                    next_index: 0,
+                },
+            );
+            println!("wallet `{name}` imported");
+            println!("address: {}", manager.account_address().to_hex());
+            println!("one_time_root: {}", hex::encode(manager.one_time_root()));
+            Ok(())
+        }
+        ["wallet", "export", name] => {
+            let entry = wallets
+                .get(*name)
+                .ok_or_else(|| format!("wallet `{}` not found", name))?;
+            println!("wallet: {name}");
+            if let Some(mnemonic) = &entry.mnemonic {
+                println!("mnemonic: {mnemonic}");
+            }
+            if let Some(secret_hex) = &entry.master_secret_hex {
+                println!("master_secret_hex: {secret_hex}");
+            }
+            println!("network: {}", entry.network);
+            println!("pool_size: {}", entry.pool_size);
+            println!("next_index: {}", entry.next_index);
+            Ok(())
+        }
+        ["balance", target] => {
+            let address = if let Some(name) = target.strip_prefix("wallet:") {
+                let entry = wallets
+                    .get(name)
+                    .ok_or_else(|| format!("wallet `{}` not found", name))?;
+                manager_from_entry(entry)?.account_address()
+            } else {
+                Address::from_hex(target).map_err(|e| format!("invalid address: {e}"))?
+            };
+            let balance = state.balance_of(address);
+            println!("address: {}", address.to_hex());
+            println!("balance: {balance}");
+            Ok(())
+        }
+        ["send", from_wallet, to_address_hex, amount_str] => {
+            let amount = amount_str
+                .parse::<u64>()
+                .map_err(|e| format!("invalid amount: {e}"))?;
+            if amount == 0 {
+                return Err("amount must be > 0".to_string());
+            }
 
-    let moved_object = state
-        .get_object(object_address)
-        .expect("object should exist");
-    let moved_coin = state.get_coin(coin_address).expect("coin should exist");
+            let entry = wallets
+                .get_mut(*from_wallet)
+                .ok_or_else(|| format!("wallet `{}` not found", from_wallet))?;
+            let mut sender_manager = manager_from_entry(entry)?;
+            sender_manager.set_next_index(entry.next_index);
+            let sender = sender_manager.account_address();
+            let recipient =
+                Address::from_hex(to_address_hex).map_err(|e| format!("invalid recipient: {e}"))?;
 
-    println!("object address: {}", moved_object.object_address().to_hex());
-    println!("coin address: {}", moved_coin.object_address.to_hex());
-    println!("object owner: {}", moved_object.owner().to_hex());
-    println!("coin owner: {}", moved_coin.owner.to_hex());
-    println!(
-        "transaction json:\n{}",
-        tx.to_json_pretty()
-            .expect("transaction json serialization failed")
+            match state.register_one_time_root(sender, sender_manager.one_time_root()) {
+                Ok(()) => {}
+                Err(StateError::OneTimeRootAlreadyRegistered) => {}
+                Err(e) => return Err(format!("root register failed: {e:?}")),
+            }
+
+            let source_coin = state
+                .first_coin_covering(sender, amount)
+                .ok_or_else(|| "no spendable coin with requested amount".to_string())?;
+
+            let signer = sender_manager
+                .issue_one_time_signer()
+                .map_err(|e| format!("one-time signer issue failed: {e:?}"))?;
+
+            let recipient_coin_address = ObjectAddress::new_unique();
+            let change_coin_address = if source_coin.amount > amount {
+                Some(ObjectAddress::new_unique())
+            } else {
+                None
+            };
+
+            let tx = Transaction::new_unsigned(
+                &signer,
+                state.chain_id(),
+                state.nonce_of(sender),
+                vec![Effect::TransferCoinAmount {
+                    from_coin_address: source_coin.object_address,
+                    amount,
+                    recipient,
+                    recipient_coin_address,
+                    change_coin_address,
+                }],
+            )
+            .sign(&signer)
+            .map_err(|e| format!("tx signing failed: {e:?}"))?;
+
+            state
+                .apply_tx(&tx)
+                .map_err(|e| format!("tx apply failed: {e:?}"))?;
+
+            entry.next_index = sender_manager.next_index();
+            println!("tx applied");
+            println!("{}", tx.to_json_pretty().map_err(|e| format!("tx json failed: {e}"))?);
+            println!("sender balance: {}", state.balance_of(sender));
+            println!("recipient balance: {}", state.balance_of(recipient));
+            Ok(())
+        }
+        ["tx", "list"] => {
+            for tx in state.tx_history(20) {
+                println!(
+                    "#{} sender={} nonce={} otk_index={} effects={:?}",
+                    tx.id, tx.sender, tx.nonce, tx.one_time_index, tx.effect_kinds
+                );
+            }
+            Ok(())
+        }
+        ["tx", "list", limit_str] => {
+            let limit = limit_str
+                .parse::<usize>()
+                .map_err(|e| format!("invalid limit: {e}"))?;
+            for tx in state.tx_history(limit) {
+                println!(
+                    "#{} sender={} nonce={} otk_index={} effects={:?}",
+                    tx.id, tx.sender, tx.nonce, tx.one_time_index, tx.effect_kinds
+                );
+            }
+            Ok(())
+        }
+        ["tx", "show", id_str] => {
+            let id = id_str
+                .parse::<u64>()
+                .map_err(|e| format!("invalid tx id: {e}"))?;
+            let tx = state
+                .tx_by_id(id)
+                .ok_or_else(|| format!("tx #{} not found", id))?;
+            println!(
+                "id={} chain_id={} sender={} nonce={} one_time_index={} effects_len={} effects={:?}",
+                tx.id,
+                tx.chain_id,
+                tx.sender,
+                tx.nonce,
+                tx.one_time_index,
+                tx.effects_len,
+                tx.effect_kinds
+            );
+            Ok(())
+        }
+        ["genesis", "show"] => {
+            let entry = wallets
+                .get(GENESIS_ALIAS)
+                .ok_or_else(|| "genesis wallet missing".to_string())?;
+            let manager = manager_from_entry(entry)?;
+            if let Some(mnemonic) = &entry.mnemonic {
+                println!("genesis mnemonic: {mnemonic}");
+            }
+            println!("genesis address: {}", manager.account_address().to_hex());
+            println!("genesis root: {}", hex::encode(manager.one_time_root()));
+            println!("genesis balance: {}", state.balance_of(manager.account_address()));
+            Ok(())
+        }
+        ["spectator", "object", object_address_hex] | ["spectator", object_address_hex] => {
+            let object_address = ObjectAddress::from_hex(object_address_hex)?;
+            if let Some(object) = state.get_object(object_address) {
+                let json = serde_json::to_string_pretty(object)
+                    .map_err(|e| format!("object encode failed: {e}"))?;
+                println!("kind: object");
+                println!("{json}");
+                return Ok(());
+            }
+            if let Some(coin) = state.get_coin(object_address) {
+                let json = serde_json::to_string_pretty(coin)
+                    .map_err(|e| format!("coin encode failed: {e}"))?;
+                println!("kind: coin");
+                println!("{json}");
+                return Ok(());
+            }
+            Err("object not found".to_string())
+        }
+        ["spectator", "tx", "list"] => {
+            for tx in state.tx_history(20) {
+                println!(
+                    "#{} sender={} nonce={} otk_index={} effects={:?}",
+                    tx.id, tx.sender, tx.nonce, tx.one_time_index, tx.effect_kinds
+                );
+            }
+            Ok(())
+        }
+        ["spectator", "tx", "show", id_str] => {
+            let id = id_str
+                .parse::<u64>()
+                .map_err(|e| format!("invalid tx id: {e}"))?;
+            let tx = state
+                .tx_by_id(id)
+                .ok_or_else(|| format!("tx #{} not found", id))?;
+            println!(
+                "id={} chain_id={} sender={} nonce={} one_time_index={} effects_len={} effects={:?}",
+                tx.id,
+                tx.chain_id,
+                tx.sender,
+                tx.nonce,
+                tx.one_time_index,
+                tx.effects_len,
+                tx.effect_kinds
+            );
+            Ok(())
+        }
+        _ => Err("unknown command. use `help`".to_string()),
+    }
+}
+
+fn ensure_genesis(
+    state: &mut State,
+    wallets: &mut HashMap<String, WalletEntry>,
+) -> Result<(), String> {
+    if state.is_genesis_applied() {
+        return Ok(());
+    }
+
+    let genesis_manager =
+        MasterAccountKeyManager::from_mnemonic_phrase(GENESIS_MNEMONIC, DEFAULT_NETWORK, DEFAULT_POOL_SIZE)
+            .map_err(|e| format!("genesis mnemonic invalid: {e:?}"))?;
+    let genesis_address = genesis_manager.account_address();
+
+    match state.register_one_time_root(genesis_address, genesis_manager.one_time_root()) {
+        Ok(()) => {}
+        Err(StateError::OneTimeRootAlreadyRegistered) => {}
+        Err(e) => return Err(format!("genesis root register failed: {e:?}")),
+    }
+
+    let mut token = BasicToken::new(
+        "Genesis Coin",
+        "GEN",
+        9,
+        "Genesis allocation token",
+        Some(1_000_000_000_000),
     );
+    let genesis_coin = token
+        .mint(genesis_address, GENESIS_SUPPLY)
+        .map_err(|e| format!("genesis mint failed: {e:?}"))?;
+    state.insert_coin(genesis_coin);
+    state.mark_genesis_applied();
+
+    wallets.insert(
+        GENESIS_ALIAS.to_string(),
+        WalletEntry {
+            mnemonic: Some(GENESIS_MNEMONIC.to_string()),
+            master_secret_hex: None,
+            network: DEFAULT_NETWORK,
+            pool_size: DEFAULT_POOL_SIZE,
+            next_index: 0,
+        },
+    );
+
+    println!("genesis applied");
+    println!("genesis address: {}", genesis_address.to_hex());
+    println!("genesis minted: {}", GENESIS_SUPPLY);
+    println!("genesis mnemonic: {}", GENESIS_MNEMONIC);
+    Ok(())
+}
+
+fn manager_from_entry(entry: &WalletEntry) -> Result<MasterAccountKeyManager, String> {
+    if let Some(mnemonic) = &entry.mnemonic {
+        return MasterAccountKeyManager::from_mnemonic_phrase(
+            mnemonic,
+            entry.network,
+            entry.pool_size,
+        )
+        .map_err(|e| format!("wallet restore from mnemonic failed: {e:?}"));
+    }
+    if let Some(secret_hex) = &entry.master_secret_hex {
+        let secret = parse_hex_32(secret_hex)?;
+        return MasterAccountKeyManager::from_master_secret(secret, entry.network, entry.pool_size)
+            .map_err(|e| format!("wallet restore from secret failed: {e:?}"));
+    }
+    Err("wallet has neither mnemonic nor master secret".to_string())
+}
+
+fn load_wallets(path: &str) -> Result<HashMap<String, WalletEntry>, String> {
+    if !Path::new(path).exists() {
+        return Ok(HashMap::new());
+    }
+    let content = fs::read_to_string(path).map_err(|e| format!("wallet load failed: {e}"))?;
+    if let Ok(wallets) = serde_json::from_str::<HashMap<String, WalletEntry>>(&content) {
+        return Ok(wallets);
+    }
+
+    let legacy = serde_json::from_str::<HashMap<String, LegacyWalletEntryV1>>(&content)
+        .map_err(|e| format!("wallet parse failed: {e}"))?;
+    let migrated = legacy
+        .into_iter()
+        .map(|(name, entry)| {
+            (
+                name,
+                WalletEntry {
+                    mnemonic: Some(entry.mnemonic),
+                    master_secret_hex: None,
+                    network: entry.network,
+                    pool_size: entry.pool_size,
+                    next_index: entry.next_index,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    Ok(migrated)
+}
+
+fn save_wallets(path: &str, wallets: &HashMap<String, WalletEntry>) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    let content =
+        serde_json::to_string_pretty(wallets).map_err(|e| format!("wallet encode failed: {e}"))?;
+    fs::write(path, content).map_err(|e| format!("wallet save failed: {e}"))?;
+    Ok(())
+}
+
+fn persist_all(state: &State, wallets: &HashMap<String, WalletEntry>) -> Result<(), String> {
+    state
+        .save_to_db(DEFAULT_DB_PATH)
+        .map_err(|e| format!("state save failed: {e:?}"))?;
+    save_wallets(DEFAULT_WALLETS_PATH, wallets)?;
+    Ok(())
+}
+
+fn ensure_parent_dir(path: &str) -> Result<(), String> {
+    if let Some(parent) = Path::new(path).parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("failed to create dir {:?}: {e}", parent))?;
+    }
+    Ok(())
+}
+
+fn print_help() {
+    println!("Commands:");
+    println!("  help");
+    println!("  show-state");
+    println!("  wallet new <name>");
+    println!("  wallet import-mnemonic <name> <mnemonic words...>");
+    println!("  wallet import-secret <name> <master_secret_hex_64>");
+    println!("  wallet export <name>");
+    println!("  wallet list");
+    println!("  wallet show <name>");
+    println!("  balance <wallet:<name>|address_hex>");
+    println!("  send <from_wallet> <to_address_hex> <amount>");
+    println!("  tx list [limit]");
+    println!("  tx show <id>");
+    println!("  spectator <object_address_hex>");
+    println!("  spectator object <object_address_hex>");
+    println!("  spectator tx list");
+    println!("  spectator tx show <id>");
+    println!("  genesis show");
+}
+
+fn parse_hex_32(hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "expected 32 bytes (64 hex chars), got {} bytes",
+            bytes.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }

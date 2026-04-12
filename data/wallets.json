@@ -1,0 +1,23 @@
+{
+  "alice": {
+    "mnemonic": "weasel direct upper grant swarm slim reveal word split ethics knock slight",
+    "master_secret_hex": null,
+    "network": 1,
+    "pool_size": 1024,
+    "next_index": 0
+  },
+  "bob": {
+    "mnemonic": "language into mystery prosper unit elephant fragile soon indicate fitness sustain fault",
+    "master_secret_hex": null,
+    "network": 1,
+    "pool_size": 1024,
+    "next_index": 0
+  },
+  "genesis": {
+    "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    "master_secret_hex": null,
+    "network": 1,
+    "pool_size": 1024,
+    "next_index": 2
+  }
+}

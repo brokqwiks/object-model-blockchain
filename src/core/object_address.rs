@@ -36,4 +36,17 @@ impl ObjectAddress {
     pub fn to_hex(&self) -> String {
         hex::encode(self.bytes)
     }
+
+    pub fn from_hex(hex: &str) -> Result<Self, String> {
+        let decoded = hex::decode(hex).map_err(|e| format!("invalid hex: {e}"))?;
+        if decoded.len() != 32 {
+            return Err(format!(
+                "object address must be 32 bytes (64 hex chars), got {} bytes",
+                decoded.len()
+            ));
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&decoded);
+        Ok(Self { bytes })
+    }
 }
