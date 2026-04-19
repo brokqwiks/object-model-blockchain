@@ -174,9 +174,9 @@ impl Ownable for Coin {
 #[cfg(test)]
 mod tests {
     use crate::core::address::{Address, NETWORK_TESTNET};
-    use crate::crypto::keys::Keypair;
     use crate::core::object::Ownable;
     use crate::core::owner::Owner;
+    use crate::crypto::keys::Keypair;
     use crate::object_standards::token::{BasicToken, TokenError};
 
     fn address_with_seed(seed: u8) -> Address {
@@ -194,8 +194,7 @@ mod tests {
         assert_eq!(token.treasury.total_supply, 1_000);
 
         let mut coin = coin;
-        coin
-            .transfer_ownership(Owner::Address(alice), Owner::Address(bob))
+        coin.transfer_ownership(Owner::Address(alice), Owner::Address(bob))
             .expect("transfer should succeed");
         assert_eq!(coin.owner, bob);
 

@@ -101,8 +101,7 @@ impl MasterAccountKeyManager {
         for index in 0..pool_size as u64 {
             let sk = derive_32(&master_secret, b"OTK_SIGNING_KEY_V1", index);
             let keypair = Keypair::from_signing_key_bytes(sk);
-            let leaf =
-                one_time_leaf_hash(account_address, index, &keypair.verifying_key_bytes());
+            let leaf = one_time_leaf_hash(account_address, index, &keypair.verifying_key_bytes());
             one_time_keys.push(keypair);
             leaves.push(leaf);
         }
@@ -134,9 +133,8 @@ impl MasterAccountKeyManager {
         network: u8,
         pool_size: usize,
     ) -> Result<Self, OneTimeKeyError> {
-        let mnemonic =
-            Mnemonic::parse_in_normalized(Language::English, phrase)
-                .map_err(|_| OneTimeKeyError::InvalidMnemonic)?;
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)
+            .map_err(|_| OneTimeKeyError::InvalidMnemonic)?;
         let seed = mnemonic.to_seed_normalized("");
         let master_secret = sha256(&seed);
         Self::from_master_secret(master_secret, network, pool_size)
@@ -328,8 +326,8 @@ mod tests {
 
     #[test]
     fn one_time_signers_keep_same_account_address() {
-        let mut manager = MasterAccountKeyManager::new_random(NETWORK_TESTNET, 16)
-            .expect("manager should build");
+        let mut manager =
+            MasterAccountKeyManager::new_random(NETWORK_TESTNET, 16).expect("manager should build");
         let first = manager.issue_one_time_signer().expect("first signer");
         let second = manager.issue_one_time_signer().expect("second signer");
 
@@ -339,8 +337,9 @@ mod tests {
 
     #[test]
     fn one_time_membership_verifies_against_root() {
-        let mut manager = MasterAccountKeyManager::from_master_secret([7u8; 32], NETWORK_TESTNET, 16)
-            .expect("manager should build");
+        let mut manager =
+            MasterAccountKeyManager::from_master_secret([7u8; 32], NETWORK_TESTNET, 16)
+                .expect("manager should build");
         let root = manager.one_time_root();
         let signer = manager.issue_one_time_signer().expect("signer");
         assert!(verify_one_time_membership(

@@ -1,6 +1,7 @@
 mod core;
 mod crypto;
 mod object_standards;
+mod vm;
 
 use std::collections::HashMap;
 use std::fs;
@@ -15,10 +16,12 @@ use crate::core::{
     address::Address,
     object_address::ObjectAddress,
     state::{State, StateError},
-    tx::{Effect, Transaction},
+    tx::{ContractCode, Effect, Transaction},
 };
 use crate::crypto::keys::MasterAccountKeyManager;
 use crate::object_standards::token::BasicToken;
+use crate::vm::bytecode::Instruction;
+use crate::vm::templates;
 
 const DEFAULT_DB_PATH: &str = "./data/state.db";
 const DEFAULT_WALLETS_PATH: &str = "./data/wallets.json";
@@ -73,7 +76,9 @@ fn run_repl() -> Result<(), String> {
     loop {
         if !stdin_closed {
             print!("om-chain> ");
-            io::stdout().flush().map_err(|e| format!("flush failed: {e}"))?;
+            io::stdout()
+                .flush()
+                .map_err(|e| format!("flush failed: {e}"))?;
         }
 
         let mut line = String::new();
@@ -146,6 +151,12 @@ fn execute_command(
         println!("one_time_root: {}", hex::encode(manager.one_time_root()));
         return Ok(());
     }
+    if let Some(rest) = line.strip_prefix("contract call ") {
+        return handle_contract_call(rest, state, wallets);
+    }
+    if let Some(rest) = line.strip_prefix("contract publish-custom ") {
+        return handle_publish_custom(rest, state, wallets);
+    }
 
     let parts = line.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
@@ -159,18 +170,76 @@ fn execute_command(
             println!("genesis_applied: {}", s.genesis_applied);
             println!("objects: {}", s.objects);
             println!("coins: {}", s.coins);
+            println!("contracts: {}", s.contracts);
             println!("accounts_with_nonces: {}", s.accounts_with_nonces);
             println!("accounts_with_roots: {}", s.accounts_with_roots);
             println!("transactions: {}", s.transactions);
+            Ok(())
+        }
+        ["contract", "templates"] => {
+            println!("available templates:");
+            println!("  counter");
+            println!("  guarded_mirror");
+            Ok(())
+        }
+        ["contract", "publish", from_wallet, template_name] => {
+            let template_id = templates::template_id_by_name(template_name)
+                .ok_or_else(|| "unknown template. use `contract templates`".to_string())?;
+
+            let entry = wallets
+                .get_mut(*from_wallet)
+                .ok_or_else(|| format!("wallet `{}` not found", from_wallet))?;
+            let mut sender_manager = manager_from_entry(entry)?;
+            sender_manager.set_next_index(entry.next_index);
+            let sender = sender_manager.account_address();
+
+            match state.register_one_time_root(sender, sender_manager.one_time_root()) {
+                Ok(()) => {}
+                Err(StateError::OneTimeRootAlreadyRegistered) => {}
+                Err(e) => return Err(format!("root register failed: {e:?}")),
+            }
+
+            let signer = sender_manager
+                .issue_one_time_signer()
+                .map_err(|e| format!("one-time signer issue failed: {e:?}"))?;
+
+            let contract_address = ObjectAddress::new_unique();
+            let tx = Transaction::new_unsigned(
+                &signer,
+                state.chain_id(),
+                state.nonce_of(sender),
+                vec![Effect::PublishContract {
+                    contract_address,
+                    code: ContractCode::Template { template_id },
+                }],
+            )
+            .sign(&signer)
+            .map_err(|e| format!("tx signing failed: {e:?}"))?;
+
+            state
+                .apply_tx(&tx)
+                .map_err(|e| format!("tx apply failed: {e:?}"))?;
+
+            entry.next_index = sender_manager.next_index();
+            println!("contract published");
+            println!("template: {template_name}");
+            println!("address: {}", contract_address.to_hex());
+            println!(
+                "{}",
+                tx.to_json_pretty()
+                    .map_err(|e| format!("tx json failed: {e}"))?
+            );
             Ok(())
         }
         ["wallet", "new", name] => {
             if wallets.contains_key(*name) {
                 return Err(format!("wallet `{}` already exists", name));
             }
-            let (mnemonic, manager) =
-                MasterAccountKeyManager::new_from_random_mnemonic(DEFAULT_NETWORK, DEFAULT_POOL_SIZE)
-                    .map_err(|e| format!("wallet generation failed: {e:?}"))?;
+            let (mnemonic, manager) = MasterAccountKeyManager::new_from_random_mnemonic(
+                DEFAULT_NETWORK,
+                DEFAULT_POOL_SIZE,
+            )
+            .map_err(|e| format!("wallet generation failed: {e:?}"))?;
             let address = manager.account_address();
             let root = manager.one_time_root();
             wallets.insert(
@@ -336,13 +405,26 @@ fn execute_command(
 
             entry.next_index = sender_manager.next_index();
             println!("tx applied");
-            println!("{}", tx.to_json_pretty().map_err(|e| format!("tx json failed: {e}"))?);
+            println!(
+                "{}",
+                tx.to_json_pretty()
+                    .map_err(|e| format!("tx json failed: {e}"))?
+            );
             println!("sender balance: {}", state.balance_of(sender));
             println!("recipient balance: {}", state.balance_of(recipient));
             Ok(())
         }
         ["tx", "list"] => {
             for tx in state.tx_history(20) {
+                println!(
+                    "#{} sender={} nonce={} otk_index={} effects={:?}",
+                    tx.id, tx.sender, tx.nonce, tx.one_time_index, tx.effect_kinds
+                );
+            }
+            Ok(())
+        }
+        ["tx", "list", "all"] => {
+            for tx in state.tx_history_all() {
                 println!(
                     "#{} sender={} nonce={} otk_index={} effects={:?}",
                     tx.id, tx.sender, tx.nonce, tx.one_time_index, tx.effect_kinds
@@ -360,6 +442,12 @@ fn execute_command(
                     tx.id, tx.sender, tx.nonce, tx.one_time_index, tx.effect_kinds
                 );
             }
+            Ok(())
+        }
+        ["tx", "dump"] => {
+            let json = serde_json::to_string_pretty(&state.tx_history_all())
+                .map_err(|e| format!("tx dump encode failed: {e}"))?;
+            println!("{json}");
             Ok(())
         }
         ["tx", "show", id_str] => {
@@ -391,7 +479,10 @@ fn execute_command(
             }
             println!("genesis address: {}", manager.account_address().to_hex());
             println!("genesis root: {}", hex::encode(manager.one_time_root()));
-            println!("genesis balance: {}", state.balance_of(manager.account_address()));
+            println!(
+                "genesis balance: {}",
+                state.balance_of(manager.account_address())
+            );
             Ok(())
         }
         ["spectator", "object", object_address_hex] | ["spectator", object_address_hex] => {
@@ -410,10 +501,41 @@ fn execute_command(
                 println!("{json}");
                 return Ok(());
             }
+            if let Some(contract) = state.get_contract(object_address) {
+                let json = serde_json::to_string_pretty(contract)
+                    .map_err(|e| format!("contract encode failed: {e}"))?;
+                println!("kind: contract");
+                println!("{json}");
+                return Ok(());
+            }
             Err("object not found".to_string())
+        }
+        ["spectator", "contract", contract_address_hex] => {
+            let contract_address = ObjectAddress::from_hex(contract_address_hex)?;
+            let Some(contract) = state.get_contract(contract_address) else {
+                return Err("contract not found".to_string());
+            };
+            let json = serde_json::to_string_pretty(contract)
+                .map_err(|e| format!("contract encode failed: {e}"))?;
+            println!("{json}");
+            Ok(())
+        }
+        ["spectator", "account", target] => {
+            let owner = parse_account_target(target, wallets)?;
+            print_account_objects(state, owner)?;
+            Ok(())
         }
         ["spectator", "tx", "list"] => {
             for tx in state.tx_history(20) {
+                println!(
+                    "#{} sender={} nonce={} otk_index={} effects={:?}",
+                    tx.id, tx.sender, tx.nonce, tx.one_time_index, tx.effect_kinds
+                );
+            }
+            Ok(())
+        }
+        ["spectator", "tx", "list", "all"] => {
+            for tx in state.tx_history_all() {
                 println!(
                     "#{} sender={} nonce={} otk_index={} effects={:?}",
                     tx.id, tx.sender, tx.nonce, tx.one_time_index, tx.effect_kinds
@@ -452,9 +574,12 @@ fn ensure_genesis(
         return Ok(());
     }
 
-    let genesis_manager =
-        MasterAccountKeyManager::from_mnemonic_phrase(GENESIS_MNEMONIC, DEFAULT_NETWORK, DEFAULT_POOL_SIZE)
-            .map_err(|e| format!("genesis mnemonic invalid: {e:?}"))?;
+    let genesis_manager = MasterAccountKeyManager::from_mnemonic_phrase(
+        GENESIS_MNEMONIC,
+        DEFAULT_NETWORK,
+        DEFAULT_POOL_SIZE,
+    )
+    .map_err(|e| format!("genesis mnemonic invalid: {e:?}"))?;
     let genesis_address = genesis_manager.account_address();
 
     match state.register_one_time_root(genesis_address, genesis_manager.one_time_root()) {
@@ -558,15 +683,19 @@ fn persist_all(state: &State, wallets: &HashMap<String, WalletEntry>) -> Result<
 
 fn ensure_parent_dir(path: &str) -> Result<(), String> {
     if let Some(parent) = Path::new(path).parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("failed to create dir {:?}: {e}", parent))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create dir {:?}: {e}", parent))?;
     }
     Ok(())
 }
 
 fn print_help() {
-    println!("Commands:");
+    println!("Core:");
     println!("  help");
     println!("  show-state");
+    println!("  genesis show");
+    println!();
+    println!("Wallets:");
     println!("  wallet new <name>");
     println!("  wallet import-mnemonic <name> <mnemonic words...>");
     println!("  wallet import-secret <name> <master_secret_hex_64>");
@@ -574,14 +703,240 @@ fn print_help() {
     println!("  wallet list");
     println!("  wallet show <name>");
     println!("  balance <wallet:<name>|address_hex>");
+    println!();
+    println!("Transfers:");
     println!("  send <from_wallet> <to_address_hex> <amount>");
-    println!("  tx list [limit]");
+    println!();
+    println!("Contracts:");
+    println!("  contract templates");
+    println!("  contract publish <from_wallet> <counter|guarded_mirror>");
+    println!("  contract publish-custom <from_wallet> <name> <bytecode_json_path>");
+    println!("  contract call <from_wallet> <contract_address_hex> [max_steps] [json_args]");
+    println!();
+    println!("Transactions:");
+    println!("  tx list");
+    println!("  tx list <limit>");
+    println!("  tx list all");
     println!("  tx show <id>");
+    println!("  tx dump");
+    println!();
+    println!("Spectator:");
     println!("  spectator <object_address_hex>");
     println!("  spectator object <object_address_hex>");
+    println!("  spectator contract <contract_address_hex>");
+    println!("  spectator account <wallet:<name>|address_hex>");
     println!("  spectator tx list");
+    println!("  spectator tx list all");
     println!("  spectator tx show <id>");
-    println!("  genesis show");
+}
+
+fn handle_contract_call(
+    rest: &str,
+    state: &mut State,
+    wallets: &mut HashMap<String, WalletEntry>,
+) -> Result<(), String> {
+    let mut first_split = rest.splitn(3, ' ');
+    let from_wallet = first_split
+        .next()
+        .ok_or_else(|| {
+            "usage: contract call <from_wallet> <contract_address_hex> [max_steps] [json_args]"
+                .to_string()
+        })?
+        .trim();
+    let contract_hex = first_split
+        .next()
+        .ok_or_else(|| {
+            "usage: contract call <from_wallet> <contract_address_hex> [max_steps] [json_args]"
+                .to_string()
+        })?
+        .trim();
+    if from_wallet.is_empty() || contract_hex.is_empty() {
+        return Err(
+            "usage: contract call <from_wallet> <contract_address_hex> [max_steps] [json_args]"
+                .to_string(),
+        );
+    }
+    let contract_address = ObjectAddress::from_hex(contract_hex)?;
+    let tail = first_split.next().unwrap_or("").trim();
+
+    let mut max_steps = 10_000u32;
+    let mut call_args_json = "[]".to_string();
+    if !tail.is_empty() {
+        let mut tail_parts = tail.splitn(2, ' ');
+        let first = tail_parts.next().unwrap_or("");
+        if let Ok(parsed) = first.parse::<u32>() {
+            max_steps = parsed;
+            let rest_json = tail_parts.next().unwrap_or("").trim();
+            if !rest_json.is_empty() {
+                call_args_json = rest_json.to_string();
+            }
+        } else {
+            call_args_json = tail.to_string();
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(&call_args_json)
+        .map_err(|e| format!("invalid json args: {e}"))?;
+
+    let entry = wallets
+        .get_mut(from_wallet)
+        .ok_or_else(|| format!("wallet `{}` not found", from_wallet))?;
+    let mut sender_manager = manager_from_entry(entry)?;
+    sender_manager.set_next_index(entry.next_index);
+    let sender = sender_manager.account_address();
+
+    match state.register_one_time_root(sender, sender_manager.one_time_root()) {
+        Ok(()) => {}
+        Err(StateError::OneTimeRootAlreadyRegistered) => {}
+        Err(e) => return Err(format!("root register failed: {e:?}")),
+    }
+
+    let signer = sender_manager
+        .issue_one_time_signer()
+        .map_err(|e| format!("one-time signer issue failed: {e:?}"))?;
+
+    let tx = Transaction::new_unsigned(
+        &signer,
+        state.chain_id(),
+        state.nonce_of(sender),
+        vec![Effect::ExecuteContract {
+            contract_address,
+            max_steps,
+            call_args_json,
+        }],
+    )
+    .sign(&signer)
+    .map_err(|e| format!("tx signing failed: {e:?}"))?;
+
+    state
+        .apply_tx(&tx)
+        .map_err(|e| format!("tx apply failed: {e:?}"))?;
+
+    entry.next_index = sender_manager.next_index();
+    println!("contract call applied");
+    println!(
+        "{}",
+        tx.to_json_pretty()
+            .map_err(|e| format!("tx json failed: {e}"))?
+    );
+    if let Some(contract) = state.get_contract(contract_address) {
+        println!("contract version: {}", contract.version());
+        println!("contract owner: {:?}", contract.owner());
+        println!("storage: {:?}", contract.storage);
+        println!("events: {:?}", contract.event_log);
+    }
+    Ok(())
+}
+
+fn handle_publish_custom(
+    rest: &str,
+    state: &mut State,
+    wallets: &mut HashMap<String, WalletEntry>,
+) -> Result<(), String> {
+    let mut parts = rest.splitn(3, ' ');
+    let from_wallet = parts.next().ok_or_else(|| {
+        "usage: contract publish-custom <from_wallet> <name> <bytecode_json_path>".to_string()
+    })?;
+    let name = parts.next().ok_or_else(|| {
+        "usage: contract publish-custom <from_wallet> <name> <bytecode_json_path>".to_string()
+    })?;
+    let path = parts.next().ok_or_else(|| {
+        "usage: contract publish-custom <from_wallet> <name> <bytecode_json_path>".to_string()
+    })?;
+
+    let bytecode_content =
+        fs::read_to_string(path).map_err(|e| format!("failed to read bytecode file: {e}"))?;
+    let bytecode = serde_json::from_str::<Vec<Instruction>>(&bytecode_content)
+        .map_err(|e| format!("invalid bytecode json: {e}"))?;
+    if bytecode.is_empty() {
+        return Err("bytecode is empty".to_string());
+    }
+
+    let entry = wallets
+        .get_mut(from_wallet)
+        .ok_or_else(|| format!("wallet `{}` not found", from_wallet))?;
+    let mut sender_manager = manager_from_entry(entry)?;
+    sender_manager.set_next_index(entry.next_index);
+    let sender = sender_manager.account_address();
+
+    match state.register_one_time_root(sender, sender_manager.one_time_root()) {
+        Ok(()) => {}
+        Err(StateError::OneTimeRootAlreadyRegistered) => {}
+        Err(e) => return Err(format!("root register failed: {e:?}")),
+    }
+
+    let signer = sender_manager
+        .issue_one_time_signer()
+        .map_err(|e| format!("one-time signer issue failed: {e:?}"))?;
+
+    let contract_address = ObjectAddress::new_unique();
+    let tx = Transaction::new_unsigned(
+        &signer,
+        state.chain_id(),
+        state.nonce_of(sender),
+        vec![Effect::PublishContract {
+            contract_address,
+            code: ContractCode::Custom {
+                name: name.to_string(),
+                bytecode,
+            },
+        }],
+    )
+    .sign(&signer)
+    .map_err(|e| format!("tx signing failed: {e:?}"))?;
+
+    state
+        .apply_tx(&tx)
+        .map_err(|e| format!("tx apply failed: {e:?}"))?;
+
+    entry.next_index = sender_manager.next_index();
+    println!("custom contract published");
+    println!("name: {name}");
+    println!("address: {}", contract_address.to_hex());
+    println!(
+        "{}",
+        tx.to_json_pretty()
+            .map_err(|e| format!("tx json failed: {e}"))?
+    );
+    Ok(())
+}
+
+fn parse_account_target(
+    target: &str,
+    wallets: &HashMap<String, WalletEntry>,
+) -> Result<Address, String> {
+    if let Some(name) = target.strip_prefix("wallet:") {
+        let entry = wallets
+            .get(name)
+            .ok_or_else(|| format!("wallet `{}` not found", name))?;
+        return Ok(manager_from_entry(entry)?.account_address());
+    }
+    Address::from_hex(target).map_err(|e| format!("invalid address: {e}"))
+}
+
+fn print_account_objects(state: &State, owner: Address) -> Result<(), String> {
+    let objects = state.objects_of_owner(owner);
+    let coins = state.coins_of_owner(owner);
+    let contracts = state.contracts_of_owner(owner);
+    println!("account: {}", owner.to_hex());
+    println!("balance: {}", state.balance_of(owner));
+    println!(
+        "owned_counts => objects: {}, coins: {}, contracts: {}",
+        objects.len(),
+        coins.len(),
+        contracts.len()
+    );
+
+    let objects_json =
+        serde_json::to_string_pretty(&objects).map_err(|e| format!("object encode failed: {e}"))?;
+    let coins_json =
+        serde_json::to_string_pretty(&coins).map_err(|e| format!("coin encode failed: {e}"))?;
+    let contracts_json = serde_json::to_string_pretty(&contracts)
+        .map_err(|e| format!("contract encode failed: {e}"))?;
+
+    println!("objects: {objects_json}");
+    println!("coins: {coins_json}");
+    println!("contracts: {contracts_json}");
+    Ok(())
 }
 
 fn parse_hex_32(hex_str: &str) -> Result<[u8; 32], String> {

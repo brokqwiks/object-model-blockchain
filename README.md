@@ -33,10 +33,14 @@
 
 ### Что реализовано
 - Object model (`Object`, `Coin`, `Owner`, `ObjectAddress`).
+- Мини-VM для смарт-контрактов (`ObjectVM`) со стековым байткодом.
 - Transaction effects:
   - `TransferObject`
   - `TransferCoin`
+  - `TransferCoinAmount`
   - `RotateOneTimeRoot`
+  - `PublishContract`
+  - `ExecuteContract`
 - Domain separation в подписи tx:
   - `TX_INTENT_V1`
   - `chain_id`
@@ -66,14 +70,54 @@ wallet list
 wallet show <name>
 balance <wallet:<name>|address_hex>
 send <from_wallet> <to_address_hex> <amount>
+contract templates
+contract publish <from_wallet> <counter|guarded_mirror>
+contract publish-custom <from_wallet> <name> <bytecode_json_path>
+contract call <from_wallet> <contract_address_hex> [max_steps] [json_args]
+tx list all
+tx dump
+spectator account <wallet:<name>|address_hex>
+spectator contract <contract_address_hex>
 spectator <object_address_hex>
 genesis show
+```
+
+### `guarded_mirror` (как работает)
+- Берет первый числовой аргумент из JSON-массива аргументов.
+- Проверяет, что отправитель транзакции является владельцем контракта.
+- Записывает это значение в поле `last_value`.
+- Добавляет событие `guarded_mirror:value_mirrored`.
+
+Запуск:
+```text
+contract publish genesis guarded_mirror
+contract call genesis <contract_address_hex> 100 [42]
+spectator contract <contract_address_hex>
+```
+
+### Как написать и задеплоить свой контракт
+1. Создай JSON-файл с массивом инструкций VM.
+2. Выполни `contract publish-custom <wallet> <name> <bytecode_json_path>`.
+3. Вызывай контракт через `contract call <wallet> <contract_address_hex> [max_steps] [json_args]`.
+
+Пример JSON байткода:
+```json
+[
+  "AssertSenderIsOwner",
+  {"Load":"x"},
+  {"PushArg":0},
+  "Add",
+  {"Store":"x"},
+  {"Emit":"x_updated"},
+  "Halt"
+]
 ```
 
 ### Структура
 - `src/core` — модели состояния, tx, state executor.
 - `src/crypto` — подписи, генератор OTK, Merkle proof membership.
 - `src/object_standards` — token standard (`BasicToken`, `Coin`).
+- `src/vm` — виртуальная машина контрактов, байткод и шаблоны.
 
 ### Дисклеймер
 Проект учебный, не production-ready. Перед реальным запуском нужны аудит, threat modeling, p2p/consensus, продуманный key lifecycle, telemetry и расширенное тестирование.
@@ -109,10 +153,14 @@ This ensures: **master public key is never exposed in tx payload**.
 
 ### Implemented features
 - Object model (`Object`, `Coin`, `Owner`, `ObjectAddress`).
+- Smart-contract mini VM (`ObjectVM`) with stack-based bytecode.
 - Transaction effects:
   - `TransferObject`
   - `TransferCoin`
+  - `TransferCoinAmount`
   - `RotateOneTimeRoot`
+  - `PublishContract`
+  - `ExecuteContract`
 - Domain-separated transaction signing:
   - `TX_INTENT_V1`
   - `chain_id`
@@ -142,14 +190,41 @@ wallet list
 wallet show <name>
 balance <wallet:<name>|address_hex>
 send <from_wallet> <to_address_hex> <amount>
+contract templates
+contract publish <from_wallet> <counter|guarded_mirror>
+contract publish-custom <from_wallet> <name> <bytecode_json_path>
+contract call <from_wallet> <contract_address_hex> [max_steps] [json_args]
+tx list all
+tx dump
+spectator account <wallet:<name>|address_hex>
+spectator contract <contract_address_hex>
 spectator <object_address_hex>
 genesis show
 ```
+
+### `guarded_mirror` (how it works)
+- Reads the first numeric value from JSON args array.
+- Checks that transaction sender owns the contract.
+- Stores the value into `last_value`.
+- Emits event `guarded_mirror:value_mirrored`.
+
+Run:
+```text
+contract publish genesis guarded_mirror
+contract call genesis <contract_address_hex> 100 [42]
+spectator contract <contract_address_hex>
+```
+
+### How to write and deploy your own contract
+1. Create a JSON file with VM instruction array.
+2. Run `contract publish-custom <wallet> <name> <bytecode_json_path>`.
+3. Call it with `contract call <wallet> <contract_address_hex> [max_steps] [json_args]`.
 
 ### Repository layout
 - `src/core` — state models, transactions, state executor.
 - `src/crypto` — signatures, OTK manager, Merkle membership checks.
 - `src/object_standards` — token standard (`BasicToken`, `Coin`).
+- `src/vm` — contract virtual machine, bytecode runtime, templates.
 
 ### Disclaimer
 Educational project, not production-ready. A real deployment requires formal security review, threat modeling, p2p/consensus, robust key lifecycle, observability, and extensive testing.

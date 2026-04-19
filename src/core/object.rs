@@ -47,6 +47,14 @@ impl Object {
         }
     }
 
+    pub fn with_address(owner: Owner, object_address: ObjectAddress) -> Object {
+        Object {
+            object_address,
+            owner,
+            version: 0,
+        }
+    }
+
     pub fn owner(&self) -> Owner {
         self.owner
     }

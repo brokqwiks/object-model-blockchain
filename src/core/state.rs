@@ -5,10 +5,15 @@ use crate::core::{
     object::{Object, Ownable, OwnershipError},
     object_address::ObjectAddress,
     owner::Owner,
-    tx::{Effect, Transaction},
+    tx::{ContractCode, Effect, Transaction},
 };
 use crate::crypto::keys::verify_one_time_membership;
 use crate::object_standards::token::Coin;
+use crate::vm::{
+    contract::Contract,
+    runtime::{VmError, VmHost, execute_contract},
+    templates,
+};
 use rocksdb::{DB, Options};
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +23,7 @@ pub struct State {
     genesis_applied: bool,
     objects: HashMap<ObjectAddress, Object>,
     coins: HashMap<ObjectAddress, Coin>,
+    contracts: HashMap<ObjectAddress, Contract>,
     nonces: HashMap<String, u64>,
     one_time_roots: HashMap<String, [u8; 32]>,
     used_one_time_indices: HashMap<String, HashSet<u64>>,
@@ -31,6 +37,7 @@ pub struct StateSummary {
     pub genesis_applied: bool,
     pub objects: usize,
     pub coins: usize,
+    pub contracts: usize,
     pub accounts_with_nonces: usize,
     pub accounts_with_roots: usize,
     pub transactions: usize,
@@ -62,6 +69,13 @@ pub enum StateError {
     TooManyEffects,
     ObjectNotFound,
     CoinNotFound,
+    ContractNotFound,
+    ContractAlreadyExists,
+    InvalidContractTemplate,
+    InvalidContractBytecode,
+    ContractCodeTooLarge,
+    InvalidContractStepLimit,
+    VmExecutionFailed(VmError),
     InvalidCoinAmount,
     InsufficientCoinAmount,
     NotObjectOwner,
@@ -94,6 +108,7 @@ struct StateSnapshot {
     genesis_applied: bool,
     objects: HashMap<ObjectAddress, Object>,
     coins: HashMap<ObjectAddress, Coin>,
+    contracts: HashMap<ObjectAddress, Contract>,
     nonces: HashMap<String, u64>,
     one_time_roots: HashMap<String, [u8; 32]>,
     used_one_time_indices: HashMap<String, HashSet<u64>>,
@@ -106,6 +121,8 @@ const STATE_SNAPSHOT_KEY: &[u8] = b"state:snapshot:v1";
 impl State {
     const MAX_EFFECTS: usize = 128;
     const MAX_PROOF_LEN: usize = 64;
+    const MAX_CUSTOM_BYTECODE_LEN: usize = 512;
+    const MAX_CONTRACT_NAME_LEN: usize = 64;
 
     pub fn new() -> Self {
         Self {
@@ -133,6 +150,7 @@ impl State {
             genesis_applied: self.genesis_applied,
             objects: self.objects.len(),
             coins: self.coins.len(),
+            contracts: self.contracts.len(),
             accounts_with_nonces: self.nonces.len(),
             accounts_with_roots: self.one_time_roots.len(),
             transactions: self.tx_history.len(),
@@ -204,12 +222,20 @@ impl State {
         self.coins.insert(coin.object_address, coin);
     }
 
+    pub fn insert_contract(&mut self, contract: Contract) {
+        self.contracts.insert(contract.object_address(), contract);
+    }
+
     pub fn get_object(&self, object_address: ObjectAddress) -> Option<&Object> {
         self.objects.get(&object_address)
     }
 
     pub fn get_coin(&self, coin_address: ObjectAddress) -> Option<&Coin> {
         self.coins.get(&coin_address)
+    }
+
+    pub fn get_contract(&self, contract_address: ObjectAddress) -> Option<&Contract> {
+        self.contracts.get(&contract_address)
     }
 
     pub fn balance_of(&self, owner: Address) -> u64 {
@@ -226,16 +252,15 @@ impl State {
 
     pub fn tx_history(&self, limit: usize) -> Vec<TxRecord> {
         let take = limit.min(self.tx_history.len());
-        self.tx_history
-            .iter()
-            .rev()
-            .take(take)
-            .cloned()
-            .collect()
+        self.tx_history.iter().rev().take(take).cloned().collect()
     }
 
     pub fn tx_by_id(&self, id: u64) -> Option<TxRecord> {
         self.tx_history.iter().find(|tx| tx.id == id).cloned()
+    }
+
+    pub fn tx_history_all(&self) -> Vec<TxRecord> {
+        self.tx_history.clone()
     }
 
     pub fn first_coin_covering(&self, owner: Address, min_amount: u64) -> Option<Coin> {
@@ -243,6 +268,30 @@ impl State {
             .values()
             .find(|coin| coin.owner == owner && coin.amount >= min_amount)
             .copied()
+    }
+
+    pub fn objects_of_owner(&self, owner: Address) -> Vec<Object> {
+        self.objects
+            .values()
+            .filter(|object| object.owner() == Owner::Address(owner))
+            .cloned()
+            .collect()
+    }
+
+    pub fn coins_of_owner(&self, owner: Address) -> Vec<Coin> {
+        self.coins
+            .values()
+            .filter(|coin| coin.owner == owner)
+            .copied()
+            .collect()
+    }
+
+    pub fn contracts_of_owner(&self, owner: Address) -> Vec<Contract> {
+        self.contracts
+            .values()
+            .filter(|contract| contract.owner() == Owner::Address(owner))
+            .cloned()
+            .collect()
     }
 
     pub fn apply_tx(&mut self, tx: &Transaction) -> Result<(), StateError> {
@@ -312,10 +361,8 @@ impl State {
                         return Err(StateError::ObjectNotFound);
                     };
 
-                    let result = object.transfer_ownership(
-                        Owner::Address(tx.sender),
-                        Owner::Address(*new_owner),
-                    );
+                    let result = object
+                        .transfer_ownership(Owner::Address(tx.sender), Owner::Address(*new_owner));
                     match result {
                         Ok(()) => applied_changes = applied_changes.saturating_add(1),
                         Err(OwnershipError::NotOwner) => return Err(StateError::NotObjectOwner),
@@ -330,10 +377,8 @@ impl State {
                         return Err(StateError::CoinNotFound);
                     };
 
-                    let result = coin.transfer_ownership(
-                        Owner::Address(tx.sender),
-                        Owner::Address(*new_owner),
-                    );
+                    let result = coin
+                        .transfer_ownership(Owner::Address(tx.sender), Owner::Address(*new_owner));
                     match result {
                         Ok(()) => applied_changes = applied_changes.saturating_add(1),
                         Err(OwnershipError::NotOwner) => return Err(StateError::NotCoinOwner),
@@ -389,9 +434,84 @@ impl State {
                 }
                 Effect::RotateOneTimeRoot { new_root } => {
                     self.one_time_roots.insert(sender_key.clone(), *new_root);
-                    self.used_one_time_indices.insert(sender_key.clone(), HashSet::new());
+                    self.used_one_time_indices
+                        .insert(sender_key.clone(), HashSet::new());
                     rotated_root = true;
                     applied_changes = applied_changes.saturating_add(1);
+                }
+                Effect::PublishContract {
+                    contract_address,
+                    code,
+                } => {
+                    if self.contracts.contains_key(contract_address) {
+                        return Err(StateError::ContractAlreadyExists);
+                    }
+                    let contract = match code {
+                        ContractCode::Template { template_id } => {
+                            let Some(contract) = templates::build_contract(
+                                *template_id,
+                                Owner::Address(tx.sender),
+                                *contract_address,
+                            ) else {
+                                return Err(StateError::InvalidContractTemplate);
+                            };
+                            contract
+                        }
+                        ContractCode::Custom { name, bytecode } => {
+                            if name.is_empty()
+                                || name.len() > Self::MAX_CONTRACT_NAME_LEN
+                                || bytecode.is_empty()
+                            {
+                                return Err(StateError::InvalidContractBytecode);
+                            }
+                            if bytecode.len() > Self::MAX_CUSTOM_BYTECODE_LEN {
+                                return Err(StateError::ContractCodeTooLarge);
+                            }
+                            Contract::new(
+                                Owner::Address(tx.sender),
+                                *contract_address,
+                                255,
+                                name.clone(),
+                                bytecode.clone(),
+                            )
+                        }
+                    };
+                    self.contracts.insert(*contract_address, contract);
+                    applied_changes = applied_changes.saturating_add(1);
+                }
+                Effect::ExecuteContract {
+                    contract_address,
+                    max_steps,
+                    call_args_json,
+                } => {
+                    if *max_steps == 0 {
+                        return Err(StateError::InvalidContractStepLimit);
+                    }
+                    if serde_json::from_str::<serde_json::Value>(call_args_json).is_err() {
+                        return Err(StateError::InvalidContractBytecode);
+                    }
+                    let Some(mut contract) = self.contracts.remove(contract_address) else {
+                        return Err(StateError::ContractNotFound);
+                    };
+                    let execution = execute_contract(
+                        &mut contract,
+                        self,
+                        tx.sender,
+                        call_args_json,
+                        *max_steps,
+                    );
+                    match execution {
+                        Ok(outcome) => {
+                            self.contracts.insert(*contract_address, contract);
+                            if outcome.writes > 0 {
+                                applied_changes = applied_changes.saturating_add(1);
+                            }
+                        }
+                        Err(vm_err) => {
+                            self.contracts.insert(*contract_address, contract);
+                            return Err(StateError::VmExecutionFailed(vm_err));
+                        }
+                    }
                 }
             }
         }
@@ -420,6 +540,8 @@ impl State {
                 Effect::TransferCoin { .. } => "transfer_coin".to_string(),
                 Effect::TransferCoinAmount { .. } => "transfer_coin_amount".to_string(),
                 Effect::RotateOneTimeRoot { .. } => "rotate_one_time_root".to_string(),
+                Effect::PublishContract { .. } => "publish_contract".to_string(),
+                Effect::ExecuteContract { .. } => "execute_contract".to_string(),
             })
             .collect::<Vec<_>>();
 
@@ -444,6 +566,7 @@ impl State {
             genesis_applied: self.genesis_applied,
             objects: self.objects.clone(),
             coins: self.coins.clone(),
+            contracts: self.contracts.clone(),
             nonces: self.nonces.clone(),
             one_time_roots: self.one_time_roots.clone(),
             used_one_time_indices: self.used_one_time_indices.clone(),
@@ -460,12 +583,41 @@ impl StateSnapshot {
             genesis_applied: self.genesis_applied,
             objects: self.objects,
             coins: self.coins,
+            contracts: self.contracts,
             nonces: self.nonces,
             one_time_roots: self.one_time_roots,
             used_one_time_indices: self.used_one_time_indices,
             next_tx_id: self.next_tx_id,
             tx_history: self.tx_history,
         }
+    }
+}
+
+impl VmHost for State {
+    fn owner_of_object(&self, address: ObjectAddress) -> Option<Owner> {
+        if let Some(object) = self.objects.get(&address) {
+            return Some(object.owner());
+        }
+        if let Some(coin) = self.coins.get(&address) {
+            return Some(Owner::Address(coin.owner));
+        }
+        if let Some(contract) = self.contracts.get(&address) {
+            return Some(contract.owner());
+        }
+        None
+    }
+
+    fn version_of_object(&self, address: ObjectAddress) -> Option<u64> {
+        if let Some(object) = self.objects.get(&address) {
+            return Some(object.version());
+        }
+        if let Some(coin) = self.coins.get(&address) {
+            return Some(coin.version);
+        }
+        if let Some(contract) = self.contracts.get(&address) {
+            return Some(contract.version());
+        }
+        None
     }
 }
 
@@ -487,12 +639,14 @@ mod tests {
     use crate::core::{
         address::NETWORK_TESTNET,
         object::Object,
+        object_address::ObjectAddress,
         owner::Owner,
         state::{State, StateError},
-        tx::{Effect, Transaction},
+        tx::{ContractCode, Effect, Transaction},
     };
     use crate::crypto::keys::MasterAccountKeyManager;
     use crate::object_standards::token::{BasicToken, Coin};
+    use crate::vm::runtime::VmError;
 
     fn manager_with_seed(seed: u8) -> MasterAccountKeyManager {
         MasterAccountKeyManager::from_master_secret([seed; 32], NETWORK_TESTNET, 64)
@@ -693,15 +847,108 @@ mod tests {
         let new_manager = manager_with_seed(54);
         let new_root = new_manager.one_time_root();
         let signer = sender_keys.issue_one_time_signer().expect("signer");
-        let tx = Transaction::new_unsigned(
-            &signer,
-            1,
-            0,
-            vec![Effect::RotateOneTimeRoot { new_root }],
-        )
-        .sign(&signer)
-        .expect("sign should succeed");
+        let tx =
+            Transaction::new_unsigned(&signer, 1, 0, vec![Effect::RotateOneTimeRoot { new_root }])
+                .sign(&signer)
+                .expect("sign should succeed");
 
         state.apply_tx(&tx).expect("rotation should apply");
+    }
+
+    #[test]
+    fn publish_and_execute_counter_contract() {
+        let mut sender_keys = manager_with_seed(60);
+        let sender = sender_keys.account_address();
+        let mut state = State::new();
+        state
+            .register_one_time_root(sender, sender_keys.one_time_root())
+            .expect("root register");
+
+        let contract_address = ObjectAddress::new_unique();
+        let publish_signer = sender_keys.issue_one_time_signer().expect("publish signer");
+        let publish_tx = Transaction::new_unsigned(
+            &publish_signer,
+            1,
+            0,
+            vec![Effect::PublishContract {
+                contract_address,
+                code: ContractCode::Template { template_id: 1 },
+            }],
+        )
+        .sign(&publish_signer)
+        .expect("publish sign");
+        state.apply_tx(&publish_tx).expect("publish should apply");
+
+        let call_signer = sender_keys.issue_one_time_signer().expect("call signer");
+        let call_tx = Transaction::new_unsigned(
+            &call_signer,
+            1,
+            1,
+            vec![Effect::ExecuteContract {
+                contract_address,
+                max_steps: 100,
+                call_args_json: "[5]".to_string(),
+            }],
+        )
+        .sign(&call_signer)
+        .expect("call sign");
+        state.apply_tx(&call_tx).expect("call should apply");
+
+        let contract = state
+            .get_contract(contract_address)
+            .expect("contract should exist");
+        assert_eq!(contract.storage_value("counter"), 5);
+        assert_eq!(contract.version(), 1);
+    }
+
+    #[test]
+    fn execute_contract_by_non_owner_fails() {
+        let mut owner_keys = manager_with_seed(61);
+        let mut attacker_keys = manager_with_seed(62);
+        let owner = owner_keys.account_address();
+        let attacker = attacker_keys.account_address();
+        let mut state = State::new();
+        state
+            .register_one_time_root(owner, owner_keys.one_time_root())
+            .expect("owner root register");
+        state
+            .register_one_time_root(attacker, attacker_keys.one_time_root())
+            .expect("attacker root register");
+
+        let contract_address = ObjectAddress::new_unique();
+        let publish_signer = owner_keys.issue_one_time_signer().expect("publish signer");
+        let publish_tx = Transaction::new_unsigned(
+            &publish_signer,
+            1,
+            0,
+            vec![Effect::PublishContract {
+                contract_address,
+                code: ContractCode::Template { template_id: 1 },
+            }],
+        )
+        .sign(&publish_signer)
+        .expect("publish sign");
+        state.apply_tx(&publish_tx).expect("publish should apply");
+
+        let attack_signer = attacker_keys
+            .issue_one_time_signer()
+            .expect("attack signer");
+        let attack_tx = Transaction::new_unsigned(
+            &attack_signer,
+            1,
+            0,
+            vec![Effect::ExecuteContract {
+                contract_address,
+                max_steps: 100,
+                call_args_json: "[1]".to_string(),
+            }],
+        )
+        .sign(&attack_signer)
+        .expect("attack sign");
+        let err = state.apply_tx(&attack_tx).expect_err("must fail");
+        assert_eq!(
+            err,
+            StateError::VmExecutionFailed(VmError::PermissionDenied)
+        );
     }
 }

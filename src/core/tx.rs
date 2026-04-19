@@ -1,9 +1,10 @@
 use crate::core::address::{ADDRESS_LEN, Address};
 use crate::core::object_address::ObjectAddress;
 use crate::crypto::keys::{AuthorizedOneTimeSigner, verify_signature};
+use crate::vm::bytecode::Instruction;
 use serde_json::json;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     TransferObject {
         object_address: ObjectAddress,
@@ -22,6 +23,26 @@ pub enum Effect {
     },
     RotateOneTimeRoot {
         new_root: [u8; 32],
+    },
+    PublishContract {
+        contract_address: ObjectAddress,
+        code: ContractCode,
+    },
+    ExecuteContract {
+        contract_address: ObjectAddress,
+        max_steps: u32,
+        call_args_json: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContractCode {
+    Template {
+        template_id: u8,
+    },
+    Custom {
+        name: String,
+        bytecode: Vec<Instruction>,
     },
 }
 
@@ -68,7 +89,13 @@ impl Transaction {
     pub fn signing_payload(&self) -> Vec<u8> {
         let sender_bytes = self.sender.as_bytes();
         let mut payload = Vec::with_capacity(
-            11 + 4 + 2 + ADDRESS_LEN + 32 + 8 + 8 + self.one_time_merkle_proof.len() * 32
+            11 + 4
+                + 2
+                + ADDRESS_LEN
+                + 32
+                + 8
+                + 8
+                + self.one_time_merkle_proof.len() * 32
                 + self.effects.len() * 70,
         );
         payload.extend_from_slice(b"TX_INTENT_V1");
@@ -125,6 +152,42 @@ impl Transaction {
                 Effect::RotateOneTimeRoot { new_root } => {
                     payload.push(0x03);
                     payload.extend_from_slice(new_root);
+                }
+                Effect::PublishContract {
+                    contract_address,
+                    code,
+                } => {
+                    payload.push(0x05);
+                    payload.extend_from_slice(&contract_address.as_bytes());
+                    match code {
+                        ContractCode::Template { template_id } => {
+                            payload.push(0x01);
+                            payload.push(*template_id);
+                        }
+                        ContractCode::Custom { name, bytecode } => {
+                            payload.push(0x02);
+                            payload.extend_from_slice(&(name.len() as u64).to_le_bytes());
+                            payload.extend_from_slice(name.as_bytes());
+                            payload.extend_from_slice(&(bytecode.len() as u64).to_le_bytes());
+                            for instruction in bytecode {
+                                let encoded =
+                                    serde_json::to_vec(instruction).expect("instruction encode");
+                                payload.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+                                payload.extend_from_slice(&encoded);
+                            }
+                        }
+                    }
+                }
+                Effect::ExecuteContract {
+                    contract_address,
+                    max_steps,
+                    call_args_json,
+                } => {
+                    payload.push(0x06);
+                    payload.extend_from_slice(&contract_address.as_bytes());
+                    payload.extend_from_slice(&max_steps.to_le_bytes());
+                    payload.extend_from_slice(&(call_args_json.len() as u64).to_le_bytes());
+                    payload.extend_from_slice(call_args_json.as_bytes());
                 }
             }
         }
@@ -198,6 +261,36 @@ impl Transaction {
                     json!({
                         "kind": "rotate_one_time_root",
                         "new_root": hex::encode(new_root),
+                    })
+                }
+                Effect::PublishContract {
+                    contract_address,
+                    code,
+                } => match code {
+                    ContractCode::Template { template_id } => json!({
+                        "kind": "publish_contract",
+                        "contract_address": contract_address.to_hex(),
+                        "code_kind": "template",
+                        "template_id": template_id,
+                    }),
+                    ContractCode::Custom { name, bytecode } => json!({
+                        "kind": "publish_contract",
+                        "contract_address": contract_address.to_hex(),
+                        "code_kind": "custom",
+                        "name": name,
+                        "bytecode_len": bytecode.len(),
+                    }),
+                },
+                Effect::ExecuteContract {
+                    contract_address,
+                    max_steps,
+                    call_args_json,
+                } => {
+                    json!({
+                        "kind": "execute_contract",
+                        "contract_address": contract_address.to_hex(),
+                        "max_steps": max_steps,
+                        "call_args_json": call_args_json,
                     })
                 }
             })

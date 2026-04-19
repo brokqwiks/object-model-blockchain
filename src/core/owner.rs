@@ -1,10 +1,10 @@
-use serde::{Deserialize, Serialize};
 use crate::core::address::Address;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Owner {
     Address(Address),
-    Object([u8; 32])
+    Object([u8; 32]),
 }
 
 impl Owner {
