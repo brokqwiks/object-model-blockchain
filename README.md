@@ -34,6 +34,7 @@
 ### Что реализовано
 - Object model (`Object`, `Coin`, `Owner`, `ObjectAddress`).
 - Мини-VM для смарт-контрактов (`ObjectVM`) со стековым байткодом.
+- Локальный p2p-слой (`gosslib`-совместимый модуль в проекте) + mempool.
 - Transaction effects:
   - `TransferObject`
   - `TransferCoin`
@@ -74,6 +75,13 @@ contract templates
 contract publish <from_wallet> <counter|guarded_mirror>
 contract publish-custom <from_wallet> <name> <bytecode_json_path>
 contract call <from_wallet> <contract_address_hex> [max_steps] [json_args]
+net start <port> [peer_addr ...]
+net status
+net add-peer <addr:port>
+net stop
+mempool list
+mempool apply-one
+mempool clear
 tx list all
 tx dump
 spectator account <wallet:<name>|address_hex>
@@ -111,6 +119,19 @@ spectator contract <contract_address_hex>
   {"Emit":"x_updated"},
   "Halt"
 ]
+```
+
+### Локальная сеть и mempool (без консенсуса)
+- Сеть работает по localhost TCP gossip.
+- Входящие tx попадают в mempool.
+- `ConsensusAdapter` сейчас no-op, но интерфейс уже есть для интеграции консенсуса.
+- Для теста нескольких нод запускай отдельные процессы:
+```text
+# node A
+net start 9101
+
+# node B (peer на A)
+net start 9102 127.0.0.1:9101
 ```
 
 ### Структура
@@ -154,6 +175,7 @@ This ensures: **master public key is never exposed in tx payload**.
 ### Implemented features
 - Object model (`Object`, `Coin`, `Owner`, `ObjectAddress`).
 - Smart-contract mini VM (`ObjectVM`) with stack-based bytecode.
+- Local p2p layer (`gosslib`-compatible in-project module) + mempool.
 - Transaction effects:
   - `TransferObject`
   - `TransferCoin`
@@ -194,6 +216,13 @@ contract templates
 contract publish <from_wallet> <counter|guarded_mirror>
 contract publish-custom <from_wallet> <name> <bytecode_json_path>
 contract call <from_wallet> <contract_address_hex> [max_steps] [json_args]
+net start <port> [peer_addr ...]
+net status
+net add-peer <addr:port>
+net stop
+mempool list
+mempool apply-one
+mempool clear
 tx list all
 tx dump
 spectator account <wallet:<name>|address_hex>
@@ -219,6 +248,11 @@ spectator contract <contract_address_hex>
 1. Create a JSON file with VM instruction array.
 2. Run `contract publish-custom <wallet> <name> <bytecode_json_path>`.
 3. Call it with `contract call <wallet> <contract_address_hex> [max_steps] [json_args]`.
+
+### Local network and mempool (no consensus yet)
+- Networking runs as localhost TCP gossip.
+- Incoming transactions are added to mempool.
+- `ConsensusAdapter` is currently no-op, but the interface is ready for future consensus integration.
 
 ### Repository layout
 - `src/core` — state models, transactions, state executor.

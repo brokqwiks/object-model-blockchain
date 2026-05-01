@@ -2,9 +2,10 @@ use crate::core::address::{ADDRESS_LEN, Address};
 use crate::core::object_address::ObjectAddress;
 use crate::crypto::keys::{AuthorizedOneTimeSigner, verify_signature};
 use crate::vm::bytecode::Instruction;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Effect {
     TransferObject {
         object_address: ObjectAddress,
@@ -35,7 +36,7 @@ pub enum Effect {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContractCode {
     Template {
         template_id: u8,
@@ -46,7 +47,7 @@ pub enum ContractCode {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub chain_id: u32,
     pub tx_version: u16,
@@ -56,6 +57,7 @@ pub struct Transaction {
     pub one_time_merkle_proof: Vec<[u8; 32]>,
     pub nonce: u64,
     pub effects: Vec<Effect>,
+    #[serde(with = "sig64_hex")]
     pub signature: [u8; 64],
 }
 
@@ -64,6 +66,31 @@ pub enum TxError {
     SignerAccountMismatch,
     SignerOneTimeKeyMismatch,
     SignerIndexMismatch,
+}
+
+mod sig64_hex {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as DeError};
+
+    pub fn serialize<S>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(value))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex = String::deserialize(deserializer)?;
+        let decoded = hex::decode(&hex).map_err(D::Error::custom)?;
+        if decoded.len() != 64 {
+            return Err(D::Error::custom("signature must be 64 bytes"));
+        }
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&decoded);
+        Ok(out)
+    }
 }
 
 impl Transaction {

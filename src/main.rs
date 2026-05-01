@@ -1,5 +1,6 @@
 mod core;
 mod crypto;
+mod network;
 mod object_standards;
 mod vm;
 
@@ -7,6 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -19,6 +21,9 @@ use crate::core::{
     tx::{ContractCode, Effect, Transaction},
 };
 use crate::crypto::keys::MasterAccountKeyManager;
+use crate::network::consensus::{ConsensusAdapter, NoopConsensus};
+use crate::network::gosslib::{NetworkConfig, NetworkService};
+use crate::network::mempool::{Mempool, tx_id};
 use crate::object_standards::token::BasicToken;
 use crate::vm::bytecode::Instruction;
 use crate::vm::templates;
@@ -49,6 +54,12 @@ struct LegacyWalletEntryV1 {
     next_index: u64,
 }
 
+struct AppRuntime {
+    mempool: Arc<Mutex<Mempool>>,
+    network: Option<NetworkService>,
+    consensus: Arc<dyn ConsensusAdapter>,
+}
+
 fn main() {
     if let Err(err) = run_repl() {
         eprintln!("fatal error: {err}");
@@ -62,6 +73,12 @@ fn run_repl() -> Result<(), String> {
     let mut wallets = load_wallets(DEFAULT_WALLETS_PATH)?;
     let mut state = State::load_or_create(DEFAULT_DB_PATH, 1)
         .map_err(|e| format!("state load/create failed: {e:?}"))?;
+    let consensus: Arc<dyn ConsensusAdapter> = Arc::new(NoopConsensus);
+    let mut app = AppRuntime {
+        mempool: Arc::new(Mutex::new(Mempool::default())),
+        network: None,
+        consensus,
+    };
 
     ensure_genesis(&mut state, &mut wallets)?;
     persist_all(&state, &wallets)?;
@@ -105,7 +122,7 @@ fn run_repl() -> Result<(), String> {
             continue;
         }
 
-        if let Err(err) = execute_command(line, &mut state, &mut wallets) {
+        if let Err(err) = execute_command(line, &mut state, &mut wallets, &mut app) {
             eprintln!("error: {err}");
         } else {
             persist_all(&state, &wallets)?;
@@ -117,6 +134,7 @@ fn execute_command(
     line: &str,
     state: &mut State,
     wallets: &mut HashMap<String, WalletEntry>,
+    app: &mut AppRuntime,
 ) -> Result<(), String> {
     if let Some(rest) = line.strip_prefix("wallet import-mnemonic ") {
         let mut parts = rest.splitn(2, ' ');
@@ -152,10 +170,10 @@ fn execute_command(
         return Ok(());
     }
     if let Some(rest) = line.strip_prefix("contract call ") {
-        return handle_contract_call(rest, state, wallets);
+        return handle_contract_call(rest, state, wallets, app);
     }
     if let Some(rest) = line.strip_prefix("contract publish-custom ") {
-        return handle_publish_custom(rest, state, wallets);
+        return handle_publish_custom(rest, state, wallets, app);
     }
 
     let parts = line.split_whitespace().collect::<Vec<_>>();
@@ -174,8 +192,77 @@ fn execute_command(
             println!("accounts_with_nonces: {}", s.accounts_with_nonces);
             println!("accounts_with_roots: {}", s.accounts_with_roots);
             println!("transactions: {}", s.transactions);
+            let mempool_len = app.mempool.lock().map(|m| m.len()).unwrap_or(0);
+            println!("mempool: {}", mempool_len);
             Ok(())
         }
+        ["net", "start", port_str] => {
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|e| format!("invalid port: {e}"))?;
+            start_network(app, port, vec![])?;
+            Ok(())
+        }
+        ["net", "start", port_str, peers @ ..] => {
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|e| format!("invalid port: {e}"))?;
+            let peer_addrs = peers.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+            start_network(app, port, peer_addrs)?;
+            Ok(())
+        }
+        ["net", "status"] => {
+            if let Some(net) = app.network.as_ref() {
+                println!("{}", net.status_line());
+            } else {
+                println!("network: stopped");
+            }
+            Ok(())
+        }
+        ["net", "stop"] => {
+            if let Some(mut net) = app.network.take() {
+                net.stop();
+                println!("network stopped");
+            } else {
+                println!("network already stopped");
+            }
+            Ok(())
+        }
+        ["net", "add-peer", addr] => {
+            let Some(net) = app.network.as_ref() else {
+                return Err("network is not started".to_string());
+            };
+            net.add_peer((*addr).to_string());
+            println!("peer added: {addr}");
+            Ok(())
+        }
+        ["mempool", "list"] => {
+            let entries = app
+                .mempool
+                .lock()
+                .map_err(|_| "mempool lock poisoned".to_string())?
+                .all();
+            for entry in entries {
+                println!(
+                    "{} sender={} nonce={} effects={}",
+                    entry.tx_id,
+                    entry.tx.sender.to_hex(),
+                    entry.tx.nonce,
+                    entry.tx.effects.len()
+                );
+            }
+            Ok(())
+        }
+        ["mempool", "clear"] => {
+            let mut mp = app
+                .mempool
+                .lock()
+                .map_err(|_| "mempool lock poisoned".to_string())?;
+            while mp.pop_front().is_some() {}
+            println!("mempool cleared");
+            Ok(())
+        }
+        ["mempool", "apply-one"] => apply_one_from_mempool(state, app),
         ["contract", "templates"] => {
             println!("available templates:");
             println!("  counter");
@@ -219,6 +306,7 @@ fn execute_command(
             state
                 .apply_tx(&tx)
                 .map_err(|e| format!("tx apply failed: {e:?}"))?;
+            on_local_tx(&tx, app)?;
 
             entry.next_index = sender_manager.next_index();
             println!("contract published");
@@ -402,6 +490,7 @@ fn execute_command(
             state
                 .apply_tx(&tx)
                 .map_err(|e| format!("tx apply failed: {e:?}"))?;
+            on_local_tx(&tx, app)?;
 
             entry.next_index = sender_manager.next_index();
             println!("tx applied");
@@ -694,6 +783,13 @@ fn print_help() {
     println!("  help");
     println!("  show-state");
     println!("  genesis show");
+    println!("  net start <port> [peer_addr ...]");
+    println!("  net status");
+    println!("  net add-peer <addr:port>");
+    println!("  net stop");
+    println!("  mempool list");
+    println!("  mempool apply-one");
+    println!("  mempool clear");
     println!();
     println!("Wallets:");
     println!("  wallet new <name>");
@@ -734,6 +830,7 @@ fn handle_contract_call(
     rest: &str,
     state: &mut State,
     wallets: &mut HashMap<String, WalletEntry>,
+    app: &mut AppRuntime,
 ) -> Result<(), String> {
     let mut first_split = rest.splitn(3, ' ');
     let from_wallet = first_split
@@ -810,6 +907,7 @@ fn handle_contract_call(
     state
         .apply_tx(&tx)
         .map_err(|e| format!("tx apply failed: {e:?}"))?;
+    on_local_tx(&tx, app)?;
 
     entry.next_index = sender_manager.next_index();
     println!("contract call applied");
@@ -831,6 +929,7 @@ fn handle_publish_custom(
     rest: &str,
     state: &mut State,
     wallets: &mut HashMap<String, WalletEntry>,
+    app: &mut AppRuntime,
 ) -> Result<(), String> {
     let mut parts = rest.splitn(3, ' ');
     let from_wallet = parts.next().ok_or_else(|| {
@@ -887,6 +986,7 @@ fn handle_publish_custom(
     state
         .apply_tx(&tx)
         .map_err(|e| format!("tx apply failed: {e:?}"))?;
+    on_local_tx(&tx, app)?;
 
     entry.next_index = sender_manager.next_index();
     println!("custom contract published");
@@ -898,6 +998,61 @@ fn handle_publish_custom(
             .map_err(|e| format!("tx json failed: {e}"))?
     );
     Ok(())
+}
+
+fn start_network(app: &mut AppRuntime, port: u16, peers: Vec<String>) -> Result<(), String> {
+    if app.network.is_some() {
+        return Err("network already started".to_string());
+    }
+    let listen_addr = format!("127.0.0.1:{port}");
+    let node_id = format!("node-{port}");
+    let config = NetworkConfig {
+        node_id,
+        listen_addr: listen_addr.clone(),
+        peers,
+    };
+    let service =
+        NetworkService::start(config, Arc::clone(&app.mempool), Arc::clone(&app.consensus))?;
+    println!("network started on {listen_addr}");
+    app.network = Some(service);
+    Ok(())
+}
+
+fn on_local_tx(tx: &Transaction, app: &mut AppRuntime) -> Result<(), String> {
+    let tx_hash = tx_id(tx);
+    app.mempool
+        .lock()
+        .map_err(|_| "mempool lock poisoned".to_string())?
+        .insert(tx.clone());
+    if let Some(net) = app.network.as_ref() {
+        net.broadcast_tx(tx);
+    }
+    app.consensus.on_mempool_tx(tx);
+    println!("mempool accepted tx: {tx_hash}");
+    Ok(())
+}
+
+fn apply_one_from_mempool(state: &mut State, app: &mut AppRuntime) -> Result<(), String> {
+    let entry = app
+        .mempool
+        .lock()
+        .map_err(|_| "mempool lock poisoned".to_string())?
+        .pop_front();
+    let Some(entry) = entry else {
+        println!("mempool is empty");
+        return Ok(());
+    };
+
+    match state.apply_tx(&entry.tx) {
+        Ok(()) => {
+            println!("applied tx from mempool: {}", entry.tx_id);
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "mempool tx {} failed on state apply: {e:?}",
+            entry.tx_id
+        )),
+    }
 }
 
 fn parse_account_target(
