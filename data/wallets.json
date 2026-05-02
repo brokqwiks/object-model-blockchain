@@ -4,13 +4,13 @@
     "master_secret_hex": null,
     "network": 1,
     "pool_size": 1024,
-    "next_index": 2
+    "next_index": 1
   },
-  "account1": {
-    "mnemonic": "dash keen neglect valid depend antenna polar twist rose vote expand beauty",
+  "test": {
+    "mnemonic": "kit poem fringe wine easy bounce seven room toilet trophy total news",
     "master_secret_hex": null,
     "network": 1,
     "pool_size": 1024,
-    "next_index": 2
+    "next_index": 0
   }
 }

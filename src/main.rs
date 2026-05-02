@@ -58,6 +58,7 @@ struct AppRuntime {
     mempool: Arc<Mutex<Mempool>>,
     network: Option<NetworkService>,
     consensus: Arc<dyn ConsensusAdapter>,
+    applied_txs: Arc<Mutex<Vec<Transaction>>>,
 }
 
 fn main() {
@@ -78,6 +79,7 @@ fn run_repl() -> Result<(), String> {
         mempool: Arc::new(Mutex::new(Mempool::default())),
         network: None,
         consensus,
+        applied_txs: Arc::new(Mutex::new(Vec::new())),
     };
 
     ensure_genesis(&mut state, &mut wallets)?;
@@ -263,6 +265,7 @@ fn execute_command(
             Ok(())
         }
         ["mempool", "apply-one"] => apply_one_from_mempool(state, app),
+        ["mempool", "apply-all"] => apply_all_from_mempool(state, app),
         ["contract", "templates"] => {
             println!("available templates:");
             println!("  counter");
@@ -789,6 +792,7 @@ fn print_help() {
     println!("  net stop");
     println!("  mempool list");
     println!("  mempool apply-one");
+    println!("  mempool apply-all");
     println!("  mempool clear");
     println!();
     println!("Wallets:");
@@ -1011,8 +1015,12 @@ fn start_network(app: &mut AppRuntime, port: u16, peers: Vec<String>) -> Result<
         listen_addr: listen_addr.clone(),
         peers,
     };
-    let service =
-        NetworkService::start(config, Arc::clone(&app.mempool), Arc::clone(&app.consensus))?;
+    let service = NetworkService::start(
+        config,
+        Arc::clone(&app.mempool),
+        Arc::clone(&app.consensus),
+        Arc::clone(&app.applied_txs),
+    )?;
     println!("network started on {listen_addr}");
     app.network = Some(service);
     Ok(())
@@ -1027,6 +1035,10 @@ fn on_local_tx(tx: &Transaction, app: &mut AppRuntime) -> Result<(), String> {
     if let Some(net) = app.network.as_ref() {
         net.broadcast_tx(tx);
     }
+    app.applied_txs
+        .lock()
+        .map_err(|_| "applied_txs lock poisoned".to_string())?
+        .push(tx.clone());
     app.consensus.on_mempool_tx(tx);
     println!("mempool accepted tx: {tx_hash}");
     Ok(())
@@ -1045,6 +1057,10 @@ fn apply_one_from_mempool(state: &mut State, app: &mut AppRuntime) -> Result<(),
 
     match state.apply_tx(&entry.tx) {
         Ok(()) => {
+            app.applied_txs
+                .lock()
+                .map_err(|_| "applied_txs lock poisoned".to_string())?
+                .push(entry.tx.clone());
             println!("applied tx from mempool: {}", entry.tx_id);
             Ok(())
         }
@@ -1053,6 +1069,35 @@ fn apply_one_from_mempool(state: &mut State, app: &mut AppRuntime) -> Result<(),
             entry.tx_id
         )),
     }
+}
+
+fn apply_all_from_mempool(state: &mut State, app: &mut AppRuntime) -> Result<(), String> {
+    let mut applied = 0usize;
+    loop {
+        let entry = app
+            .mempool
+            .lock()
+            .map_err(|_| "mempool lock poisoned".to_string())?
+            .pop_front();
+        let Some(entry) = entry else {
+            break;
+        };
+
+        match state.apply_tx(&entry.tx) {
+            Ok(()) => {
+                app.applied_txs
+                    .lock()
+                    .map_err(|_| "applied_txs lock poisoned".to_string())?
+                    .push(entry.tx);
+                applied = applied.saturating_add(1);
+            }
+            Err(e) => {
+                eprintln!("skip mempool tx {}: {e:?}", entry.tx_id);
+            }
+        }
+    }
+    println!("mempool applied: {applied}");
+    Ok(())
 }
 
 fn parse_account_target(

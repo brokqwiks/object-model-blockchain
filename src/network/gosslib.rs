@@ -29,6 +29,13 @@ enum WireMessage {
     TxBroadcast {
         tx: Transaction,
     },
+    StateSyncRequest {
+        requester: String,
+    },
+    StateSyncResponse {
+        from: String,
+        txs: Vec<Transaction>,
+    },
     Ping {
         node_id: String,
     },
@@ -40,6 +47,7 @@ pub struct NetworkService {
     peers: Arc<Mutex<HashSet<String>>>,
     mempool: Arc<Mutex<Mempool>>,
     consensus: Arc<dyn ConsensusAdapter>,
+    applied_txs: Arc<Mutex<Vec<Transaction>>>,
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -49,6 +57,7 @@ impl NetworkService {
         config: NetworkConfig,
         mempool: Arc<Mutex<Mempool>>,
         consensus: Arc<dyn ConsensusAdapter>,
+        applied_txs: Arc<Mutex<Vec<Transaction>>>,
     ) -> Result<Self, String> {
         let listener = TcpListener::bind(&config.listen_addr)
             .map_err(|e| format!("bind {} failed: {e}", config.listen_addr))?;
@@ -62,6 +71,7 @@ impl NetworkService {
         let worker_peers = Arc::clone(&peers);
         let worker_mempool = Arc::clone(&mempool);
         let worker_consensus = Arc::clone(&consensus);
+        let worker_applied_txs = Arc::clone(&applied_txs);
         let listen_addr = config.listen_addr.clone();
         let node_id = config.node_id.clone();
 
@@ -74,6 +84,7 @@ impl NetworkService {
                             &worker_peers,
                             &worker_mempool,
                             &worker_consensus,
+                            &worker_applied_txs,
                         );
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -92,6 +103,7 @@ impl NetworkService {
             peers,
             mempool,
             consensus,
+            applied_txs,
             running,
             worker: Some(worker),
         };
@@ -101,6 +113,10 @@ impl NetworkService {
             listen_addr: service.listen_addr.clone(),
         };
         let _ = service.broadcast_raw(&hello);
+        let sync_req = WireMessage::StateSyncRequest {
+            requester: service.listen_addr.clone(),
+        };
+        let _ = service.broadcast_raw(&sync_req);
 
         Ok(service)
     }
@@ -112,14 +128,24 @@ impl NetworkService {
 
     pub fn add_peer(&self, addr: String) {
         if let Ok(mut peers) = self.peers.lock() {
-            peers.insert(addr);
+            peers.insert(addr.clone());
         }
+        let hello = WireMessage::Hello {
+            node_id: self.node_id.clone(),
+            listen_addr: self.listen_addr.clone(),
+        };
+        let _ = send_to_peer(&addr, &hello);
+        let sync_req = WireMessage::StateSyncRequest {
+            requester: self.listen_addr.clone(),
+        };
+        let _ = send_to_peer(&addr, &sync_req);
     }
 
     pub fn status_line(&self) -> String {
         let peer_count = self.peers.lock().map(|p| p.len()).unwrap_or(0);
         let mempool_len = self.mempool.lock().map(|m| m.len()).unwrap_or(0);
         let _ = &self.consensus;
+        let _ = &self.applied_txs;
         format!(
             "node_id={} listen_addr={} peers={} mempool={}",
             self.node_id, self.listen_addr, peer_count, mempool_len
@@ -159,6 +185,7 @@ fn handle_connection(
     peers: &Arc<Mutex<HashSet<String>>>,
     mempool: &Arc<Mutex<Mempool>>,
     consensus: &Arc<dyn ConsensusAdapter>,
+    applied_txs: &Arc<Mutex<Vec<Transaction>>>,
 ) -> Result<(), String> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -187,6 +214,24 @@ fn handle_connection(
             }
             consensus.on_mempool_tx(&tx);
         }
+        WireMessage::StateSyncRequest { requester } => {
+            let txs = applied_txs
+                .lock()
+                .map(|v| v.clone())
+                .unwrap_or_else(|_| Vec::new());
+            let response = WireMessage::StateSyncResponse {
+                from: "node".to_string(),
+                txs,
+            };
+            let _ = send_to_peer(&requester, &response);
+        }
+        WireMessage::StateSyncResponse { from: _, txs } => {
+            if let Ok(mut mp) = mempool.lock() {
+                for tx in txs {
+                    mp.insert(tx);
+                }
+            }
+        }
         WireMessage::Ping { .. } => {}
     }
 
@@ -202,4 +247,9 @@ fn send_line(addr: &str, payload: &str) -> Result<(), String> {
         .write_all(b"\n")
         .map_err(|e| format!("newline write failed: {e}"))?;
     Ok(())
+}
+
+fn send_to_peer(addr: &str, msg: &WireMessage) -> Result<(), String> {
+    let payload = serde_json::to_string(msg).map_err(|e| format!("encode failed: {e}"))?;
+    send_line(addr, &payload)
 }
